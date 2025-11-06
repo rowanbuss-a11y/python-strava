@@ -30,6 +30,8 @@ jobs:
           # One-time bootstrap: set this temporarily to exchange for refresh token
           # Remove after first successful run
           STRAVA_AUTH_CODE: ${{ secrets.STRAVA_AUTH_CODE }}
+          # Must match the redirect URI used when generating STRAVA_AUTH_CODE
+          STRAVA_REDIRECT_URI: ${{ secrets.STRAVA_REDIRECT_URI }}
           # DB token store (Supabase/Postgres)
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_USER: ${{ secrets.DB_USER }}
