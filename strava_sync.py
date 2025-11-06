@@ -16,6 +16,23 @@ def env(name: str, required: bool = True, default: str | None = None) -> str | N
     return value
 
 
+def exchange_authorization_code(client_id: str, client_secret: str, auth_code: str) -> dict:
+    url = "https://www.strava.com/oauth/token"
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": auth_code,
+        "grant_type": "authorization_code",
+    }
+    response = requests.post(url, data=payload, timeout=30)
+    if response.status_code == 401:
+        raise RuntimeError(
+            "Unauthorized exchanging authorization code. Verify STRAVA_CLIENT_ID/SECRET and that the code is fresh and scoped 'read,activity:read_all'."
+        )
+    response.raise_for_status()
+    return response.json()
+
+
 def get_access_token() -> str:
     # Allow overriding with a direct access token (useful for quick testing)
     direct = os.environ.get("STRAVA_ACCESS_TOKEN")
@@ -25,9 +42,41 @@ def get_access_token() -> str:
     client_id = env("STRAVA_CLIENT_ID")
     client_secret = env("STRAVA_CLIENT_SECRET")
 
-    # Try to load refresh token from DB store if configured; fallback to env
+    # Try to load refresh token from DB store if configured; fallback to env; if missing, try STRAVA_AUTH_CODE
     store = TokenStore.from_env()
-    refresh_token = store.load_refresh_token() if store else env("STRAVA_REFRESH_TOKEN")
+    refresh_token = None
+    if store:
+        try:
+            refresh_token = store.load_refresh_token()
+        except Exception:
+            refresh_token = None
+    if not refresh_token:
+        env_refresh = os.environ.get("STRAVA_REFRESH_TOKEN")
+        if env_refresh:
+            refresh_token = env_refresh
+        else:
+            auth_code = os.environ.get("STRAVA_AUTH_CODE")
+            if not auth_code:
+                raise RuntimeError(
+                    "No refresh token found. Provide STRAVA_REFRESH_TOKEN or a one-time STRAVA_AUTH_CODE."
+                )
+            # Exchange authorization code to bootstrap tokens
+            data = exchange_authorization_code(client_id, client_secret, auth_code)
+            refresh_token = data.get("refresh_token")
+            # Persist for future runs
+            if store and refresh_token:
+                expires_at = int(datetime.now().timestamp()) + int(data.get("expires_in") or 0)
+                store.save_tokens(
+                    access_token=data.get("access_token"),
+                    refresh_token=refresh_token,
+                    expires_at=expires_at,
+                )
+            else:
+                # No store: advise setting secret but still return access token now
+                access_token = data.get("access_token")
+                if not access_token:
+                    raise RuntimeError("Failed to obtain access token from authorization code exchange.")
+                return access_token
 
     url = "https://www.strava.com/oauth/token"
     payload = {
@@ -201,10 +250,20 @@ def fetch_activities(access_token: str, after: datetime | None, log_path: str) -
             timeout=60,
         )
         if resp.status_code == 401:
-            # Provide actionable hint
-            raise RuntimeError(
-                "401 Unauthorized fetching activities. Likely invalid/expired access credentials. Verify STRAVA_REFRESH_TOKEN (and scopes) or use STRAVA_ACCESS_TOKEN to test."
+            # Attempt a single token refresh/rebootstrap, then retry once
+            debug_log("401 ontvangen; probeer token te verversen en opnieuw.", log_path)
+            new_token = get_access_token()
+            headers = {"Authorization": f"Bearer {new_token}"}
+            resp = requests.get(
+                "https://www.strava.com/api/v3/athlete/activities",
+                headers=headers,
+                params=params,
+                timeout=60,
             )
+            if resp.status_code == 401:
+                raise RuntimeError(
+                    "401 Unauthorized fetching activities na verversen. Controleer STRAVA_REFRESH_TOKEN of gebruik STRAVA_AUTH_CODE om te bootstrappen."
+                )
         if resp.status_code == 429:
             debug_log("Rate limit bereikt; 60s pauze.", log_path)
             time.sleep(60)
