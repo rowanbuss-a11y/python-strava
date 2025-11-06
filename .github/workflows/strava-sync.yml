@@ -27,12 +27,17 @@ jobs:
           STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
           STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
           STRAVA_REFRESH_TOKEN: ${{ secrets.STRAVA_REFRESH_TOKEN }}
+          # One-time bootstrap: set this temporarily to exchange for refresh token
+          # Remove after first successful run
+          STRAVA_AUTH_CODE: ${{ secrets.STRAVA_AUTH_CODE }}
           # DB token store (Supabase/Postgres)
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_USER: ${{ secrets.DB_USER }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_NAME: ${{ secrets.DB_NAME }}
           DB_PORT: ${{ secrets.DB_PORT }}
+          # Disable DB token store if DB is not reachable
+          DISABLE_DB_TOKEN_STORE: 1
           # Optional output file overrides
           CSV_FILE: activiteiten.csv
           JSON_FILE: activiteiten_raw.json
