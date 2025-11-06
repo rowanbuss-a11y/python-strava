@@ -42,41 +42,43 @@ def get_access_token() -> str:
     client_id = env("STRAVA_CLIENT_ID")
     client_secret = env("STRAVA_CLIENT_SECRET")
 
-    # Try to load refresh token from DB store if configured; fallback to env; if missing, try STRAVA_AUTH_CODE
+    # Prefer one-time STRAVA_AUTH_CODE if provided, to force fresh bootstrap
     store = TokenStore.from_env()
-    refresh_token = None
-    if store:
-        try:
-            refresh_token = store.load_refresh_token()
-        except Exception:
-            refresh_token = None
-    if not refresh_token:
-        env_refresh = os.environ.get("STRAVA_REFRESH_TOKEN")
-        if env_refresh:
-            refresh_token = env_refresh
+    auth_code = os.environ.get("STRAVA_AUTH_CODE")
+    if auth_code:
+        data = exchange_authorization_code(client_id, client_secret, auth_code)
+        new_refresh = data.get("refresh_token")
+        if store and new_refresh:
+            expires_at = int(datetime.now().timestamp()) + int(data.get("expires_in") or 0)
+            store.save_tokens(
+                access_token=data.get("access_token"),
+                refresh_token=new_refresh,
+                expires_at=expires_at,
+            )
         else:
-            auth_code = os.environ.get("STRAVA_AUTH_CODE")
-            if not auth_code:
-                raise RuntimeError(
-                    "No refresh token found. Provide STRAVA_REFRESH_TOKEN or a one-time STRAVA_AUTH_CODE."
-                )
-            # Exchange authorization code to bootstrap tokens
-            data = exchange_authorization_code(client_id, client_secret, auth_code)
-            refresh_token = data.get("refresh_token")
-            # Persist for future runs
-            if store and refresh_token:
-                expires_at = int(datetime.now().timestamp()) + int(data.get("expires_in") or 0)
-                store.save_tokens(
-                    access_token=data.get("access_token"),
-                    refresh_token=refresh_token,
-                    expires_at=expires_at,
-                )
+            # If no store, caller should persist STRAVA_REFRESH_TOKEN secret; still return access token now
+            access_token = data.get("access_token")
+            if not access_token:
+                raise RuntimeError("Failed to obtain access token from authorization code exchange.")
+            return access_token
+        # Continue with refreshed token flow below using the new refresh token
+        refresh_token = new_refresh
+    else:
+        # Try to load refresh token from DB store if configured; fallback to env
+        refresh_token = None
+        if store:
+            try:
+                refresh_token = store.load_refresh_token()
+            except Exception:
+                refresh_token = None
+        if not refresh_token:
+            env_refresh = os.environ.get("STRAVA_REFRESH_TOKEN")
+            if env_refresh:
+                refresh_token = env_refresh
             else:
-                # No store: advise setting secret but still return access token now
-                access_token = data.get("access_token")
-                if not access_token:
-                    raise RuntimeError("Failed to obtain access token from authorization code exchange.")
-                return access_token
+                raise RuntimeError(
+                    "No refresh token found. Provide STRAVA_REFRESH_TOKEN or set STRAVA_AUTH_CODE for one-time bootstrap."
+                )
 
     url = "https://www.strava.com/oauth/token"
     payload = {
