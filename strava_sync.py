@@ -39,7 +39,7 @@ jobs:
           GPS_FILE: strava_gps_data.csv
           DEBUG_LOG: debug_log.txt
         run: |
-          python strava_sync.py
+          python ci/strava_sync.py
 
       - name: Upload artifacts (CSV/JSON/GPS/Log)
         uses: actions/upload-artifact@v4
