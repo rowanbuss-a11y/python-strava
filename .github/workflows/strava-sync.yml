@@ -27,13 +27,19 @@ jobs:
           STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
           STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
           STRAVA_REFRESH_TOKEN: ${{ secrets.STRAVA_REFRESH_TOKEN }}
+          # DB token store (Supabase/Postgres)
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_PORT: ${{ secrets.DB_PORT }}
           # Optional output file overrides
           CSV_FILE: activiteiten.csv
           JSON_FILE: activiteiten_raw.json
           GPS_FILE: strava_gps_data.csv
           DEBUG_LOG: debug_log.txt
         run: |
-          python strava_sync.py
+          python ci/strava_sync.py
 
       - name: Upload artifacts (CSV/JSON/GPS/Log)
         uses: actions/upload-artifact@v4
