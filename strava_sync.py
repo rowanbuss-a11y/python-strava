@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 import requests
 import polyline
+import psycopg2
 
 
 def env(name: str, required: bool = True, default: str | None = None) -> str | None:
@@ -16,9 +17,17 @@ def env(name: str, required: bool = True, default: str | None = None) -> str | N
 
 
 def get_access_token() -> str:
+    # Allow overriding with a direct access token (useful for quick testing)
+    direct = os.environ.get("STRAVA_ACCESS_TOKEN")
+    if direct:
+        return direct
+
     client_id = env("STRAVA_CLIENT_ID")
     client_secret = env("STRAVA_CLIENT_SECRET")
-    refresh_token = env("STRAVA_REFRESH_TOKEN")
+
+    # Try to load refresh token from DB store if configured; fallback to env
+    store = TokenStore.from_env()
+    refresh_token = store.load_refresh_token() if store else env("STRAVA_REFRESH_TOKEN")
 
     url = "https://www.strava.com/oauth/token"
     payload = {
@@ -28,9 +37,94 @@ def get_access_token() -> str:
         "grant_type": "refresh_token",
     }
     response = requests.post(url, data=payload, timeout=30)
+    if response.status_code == 401:
+        raise RuntimeError(
+            "Unauthorized when exchanging refresh token. Check STRAVA_CLIENT_ID/SECRET/REFRESH_TOKEN and ensure the token was obtained with scope 'read,activity:read_all'."
+        )
     response.raise_for_status()
     data = response.json()
+
+    # Persist rotated refresh token if present
+    new_refresh = data.get("refresh_token")
+    expires_in = data.get("expires_in")
+    if new_refresh and store:
+        expires_at = int(datetime.now().timestamp()) + int(expires_in or 0)
+        store.save_tokens(
+            access_token=data.get("access_token"),
+            refresh_token=new_refresh,
+            expires_at=expires_at,
+        )
     return data["access_token"]
+
+
+class TokenStore:
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+        self._ensure_table()
+
+    @staticmethod
+    def from_env():
+        host = os.environ.get("DB_HOST")
+        user = os.environ.get("DB_USER")
+        password = os.environ.get("DB_PASSWORD")
+        name = os.environ.get("DB_NAME", "postgres")
+        port = os.environ.get("DB_PORT", "5432")
+        if not (host and user and password):
+            return None
+        dsn = (
+            f"host={host} user={user} password={password} dbname={name} port={port}"
+        )
+        return TokenStore(dsn)
+
+    def _ensure_table(self) -> None:
+        with psycopg2.connect(self.dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS oauth_tokens (
+                        provider TEXT PRIMARY KEY,
+                        access_token TEXT,
+                        refresh_token TEXT NOT NULL,
+                        expires_at BIGINT
+                    )
+                    """
+                )
+                conn.commit()
+
+    def load_refresh_token(self) -> str:
+        with psycopg2.connect(self.dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT refresh_token FROM oauth_tokens WHERE provider = %s",
+                    ("strava",),
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    return row[0]
+        # If not found, fallback to env in caller
+        return env("STRAVA_REFRESH_TOKEN")
+
+    def save_tokens(
+        self,
+        *,
+        access_token: str | None,
+        refresh_token: str,
+        expires_at: int | None,
+    ) -> None:
+        with psycopg2.connect(self.dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO oauth_tokens (provider, access_token, refresh_token, expires_at)
+                    VALUES ($$strava$$, %s, %s, %s)
+                    ON CONFLICT (provider) DO UPDATE SET
+                        access_token = EXCLUDED.access_token,
+                        refresh_token = EXCLUDED.refresh_token,
+                        expires_at = EXCLUDED.expires_at
+                    """,
+                    (access_token, refresh_token, expires_at),
+                )
+                conn.commit()
 
 
 def debug_log(message: str, log_path: str) -> None:
@@ -95,6 +189,11 @@ def fetch_activities(access_token: str, after: datetime | None, log_path: str) -
             params=params,
             timeout=60,
         )
+        if resp.status_code == 401:
+            # Provide actionable hint
+            raise RuntimeError(
+                "401 Unauthorized fetching activities. Likely invalid/expired access credentials. Verify STRAVA_REFRESH_TOKEN (and scopes) or use STRAVA_ACCESS_TOKEN to test."
+            )
         if resp.status_code == 429:
             debug_log("Rate limit bereikt; 60s pauze.", log_path)
             time.sleep(60)
