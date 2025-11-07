@@ -38,8 +38,7 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_NAME: ${{ secrets.DB_NAME }}
           DB_PORT: ${{ secrets.DB_PORT }}
-          # Disable DB token store if DB is not reachable
-          DISABLE_DB_TOKEN_STORE: 1
+          
           # Optional output file overrides
           CSV_FILE: activiteiten.csv
           JSON_FILE: activiteiten_raw.json
