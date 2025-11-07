@@ -28,6 +28,8 @@ def exchange_authorization_code(client_id: str, client_secret: str, auth_code: s
     redirect_uri = os.environ.get("STRAVA_REDIRECT_URI")
     if redirect_uri:
         payload["redirect_uri"] = redirect_uri
+    else:
+        print("DEBUG: Warning: STRAVA_REDIRECT_URI not set. This may cause issues if your Strava app requires it.")
 
     response = requests.post(url, data=payload, timeout=30)
     if response.status_code == 401:
@@ -37,8 +39,28 @@ def exchange_authorization_code(client_id: str, client_secret: str, auth_code: s
     try:
         response.raise_for_status()
     except requests.HTTPError as e:
-        # Surface Strava error body for easier debugging (without secrets)
-        raise RuntimeError(f"Auth code exchange failed ({response.status_code}): {response.text[:300]}") from e
+        # Parse error for better messaging
+        error_text = response.text[:500]
+        error_msg = f"Auth code exchange failed ({response.status_code}): {error_text}"
+        
+        if response.status_code == 400:
+            if "invalid" in error_text.lower() or '"code":"invalid"' in error_text:
+                error_msg = "❌ Authorization code is invalid, expired, or already used.\n\n"
+                error_msg += "Common causes:\n"
+                error_msg += "1. Code is expired (Strava codes expire quickly - use within minutes)\n"
+                error_msg += "2. Code was already used (one-time use only)\n"
+                error_msg += "3. STRAVA_REDIRECT_URI doesn't match the one used when generating the code\n"
+                error_msg += "4. Code was copied incorrectly (check for extra characters)\n\n"
+                error_msg += "To fix:\n"
+                error_msg += "1. Generate a FRESH authorization code:\n"
+                redirect_uri_hint = redirect_uri if redirect_uri else "YOUR_REDIRECT_URI"
+                error_msg += f"   https://www.strava.com/oauth/authorize?client_id={client_id}&response_type=code&redirect_uri={redirect_uri_hint}&approval_prompt=force&scope=read,activity:read_all\n"
+                error_msg += "2. Copy ONLY the 'code=' value from the redirect URL (without &scope=...)\n"
+                error_msg += "3. Update STRAVA_AUTH_CODE in GitHub Secrets immediately\n"
+                if not redirect_uri:
+                    error_msg += "4. Make sure STRAVA_REDIRECT_URI in Secrets matches the redirect URI in your Strava app settings\n"
+        
+        raise RuntimeError(error_msg) from e
     return response.json()
 
 
@@ -162,11 +184,12 @@ def get_access_token() -> str:
                     print("DEBUG: After updating, you can remove STRAVA_AUTH_CODE from Secrets.")
             print("DEBUG: Successfully obtained access token from authorization code exchange.")
             return access_token
+        except RuntimeError as e:
+            # Re-raise RuntimeError from exchange_authorization_code as-is (already has detailed message)
+            raise
         except Exception as e:
+            # For other exceptions, provide generic error
             error_msg = f"Authorization code exchange failed: {str(e)}"
-            if "400" in str(e) or "invalid" in str(e).lower():
-                error_msg += "\n  → Auth code may be expired or already used. Generate a fresh one:"
-                error_msg += f"\n  → https://www.strava.com/oauth/authorize?client_id={client_id}&response_type=code&redirect_uri=YOUR_REDIRECT_URI&approval_prompt=force&scope=read,activity:read_all"
             raise RuntimeError(error_msg) from e
     else:
         # No refresh token and no auth code
