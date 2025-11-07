@@ -42,6 +42,28 @@ def exchange_authorization_code(client_id: str, client_secret: str, auth_code: s
     return response.json()
 
 
+def _safe_log_token(token: str, label: str = "Token") -> None:
+    """Log token safely (first 8 and last 4 chars only)"""
+    if token and len(token) > 12:
+        masked = f"{token[:8]}...{token[-4:]}"
+        print(f"DEBUG: {label}: {masked}")
+    elif token:
+        print(f"DEBUG: {label}: [REDACTED]")
+
+
+def _save_refresh_token_to_file(token: str, filename: str = "new_refresh_token.txt") -> None:
+    """Save new refresh token to file for easy retrieval"""
+    try:
+        with open(filename, "w") as f:
+            f.write(f"# New Strava Refresh Token\n")
+            f.write(f"# Copy this value to STRAVA_REFRESH_TOKEN in GitHub Secrets\n")
+            f.write(f"# Generated: {datetime.now().isoformat()}\n\n")
+            f.write(token)
+        print(f"DEBUG: New refresh token saved to {filename} (download from artifacts)")
+    except Exception as e:
+        print(f"DEBUG: Could not save refresh token to file: {e}")
+
+
 def get_access_token() -> str:
     # Allow overriding with a direct access token (useful for quick testing)
     direct = os.environ.get("STRAVA_ACCESS_TOKEN")
@@ -64,7 +86,7 @@ def get_access_token() -> str:
         if env_refresh:
             refresh_token = env_refresh
 
-    # If we have a refresh token, try it first
+    # If we have a refresh token, try it first (with retry)
     if refresh_token:
         url = "https://www.strava.com/oauth/token"
         payload = {
@@ -73,45 +95,90 @@ def get_access_token() -> str:
             "refresh_token": refresh_token,
             "grant_type": "refresh_token",
         }
-        response = requests.post(url, data=payload, timeout=30)
-        if response.status_code == 200:
-            # Success: use the refreshed token
-            data = response.json()
-            # Persist rotated refresh token if present
-            new_refresh = data.get("refresh_token")
-            expires_in = data.get("expires_in")
-            if new_refresh and store:
-                expires_at = int(datetime.now().timestamp()) + int(expires_in or 0)
-                store.save_tokens(
-                    access_token=data.get("access_token"),
-                    refresh_token=new_refresh,
-                    expires_at=expires_at,
-                )
-            return data["access_token"]
-        # If refresh token failed (401), fall through to try auth code if available
+        # Retry once in case of transient errors
+        for attempt in range(2):
+            response = requests.post(url, data=payload, timeout=30)
+            if response.status_code == 200:
+                # Success: use the refreshed token
+                data = response.json()
+                # Persist rotated refresh token if present
+                new_refresh = data.get("refresh_token")
+                expires_in = data.get("expires_in")
+                if new_refresh:
+                    if store:
+                        expires_at = int(datetime.now().timestamp()) + int(expires_in or 0)
+                        store.save_tokens(
+                            access_token=data.get("access_token"),
+                            refresh_token=new_refresh,
+                            expires_at=expires_at,
+                        )
+                        print("DEBUG: New refresh token saved to database.")
+                    else:
+                        # No DB: log the new refresh token so user can update Secret
+                        _safe_log_token(new_refresh, "NEW_REFRESH_TOKEN")
+                        _save_refresh_token_to_file(new_refresh)
+                        print("DEBUG: ⚠️  IMPORTANT: Update STRAVA_REFRESH_TOKEN in GitHub Secrets with the new token above!")
+                    # If refresh token changed, update for next attempt
+                    if new_refresh != refresh_token:
+                        refresh_token = new_refresh
+                return data["access_token"]
+            elif response.status_code == 401 and attempt == 0:
+                # 401 on first attempt: token might be invalid, try once more then fallback
+                print(f"DEBUG: Refresh token exchange failed (401), attempt {attempt + 1}/2")
+                time.sleep(1)  # Brief pause before retry
+                continue
+            else:
+                # Other error or second attempt failed
+                print(f"DEBUG: Refresh token exchange failed with status {response.status_code}")
+                break
+        # If refresh token failed after retries, fall through to try auth code if available
 
     # No refresh token or refresh failed: try STRAVA_AUTH_CODE as fallback
     auth_code = os.environ.get("STRAVA_AUTH_CODE")
     if auth_code:
-        data = exchange_authorization_code(client_id, client_secret, auth_code)
-        new_refresh = data.get("refresh_token")
-        if store and new_refresh:
-            expires_at = int(datetime.now().timestamp()) + int(data.get("expires_in") or 0)
-            store.save_tokens(
-                access_token=data.get("access_token"),
-                refresh_token=new_refresh,
-                expires_at=expires_at,
-            )
-        # Return access token from auth code exchange
-        access_token = data.get("access_token")
-        if not access_token:
-            raise RuntimeError("Failed to obtain access token from authorization code exchange.")
-        return access_token
+        print("DEBUG: Attempting to exchange authorization code for tokens (refresh token unavailable or invalid)...")
+        try:
+            data = exchange_authorization_code(client_id, client_secret, auth_code)
+            new_refresh = data.get("refresh_token")
+            access_token = data.get("access_token")
+            if not access_token:
+                raise RuntimeError("Failed to obtain access token from authorization code exchange.")
+            
+            # Always save new refresh token if we got one
+            if new_refresh:
+                if store:
+                    expires_at = int(datetime.now().timestamp()) + int(data.get("expires_in") or 0)
+                    store.save_tokens(
+                        access_token=access_token,
+                        refresh_token=new_refresh,
+                        expires_at=expires_at,
+                    )
+                    print("DEBUG: New refresh token from auth code saved to database.")
+                else:
+                    # No DB: log the new refresh token so user can update Secret
+                    _safe_log_token(new_refresh, "NEW_REFRESH_TOKEN")
+                    _save_refresh_token_to_file(new_refresh)
+                    print("DEBUG: ⚠️  IMPORTANT: Copy the NEW_REFRESH_TOKEN above and update STRAVA_REFRESH_TOKEN in GitHub Secrets!")
+                    print("DEBUG: After updating, you can remove STRAVA_AUTH_CODE from Secrets.")
+            print("DEBUG: Successfully obtained access token from authorization code exchange.")
+            return access_token
+        except Exception as e:
+            error_msg = f"Authorization code exchange failed: {str(e)}"
+            if "400" in str(e) or "invalid" in str(e).lower():
+                error_msg += "\n  → Auth code may be expired or already used. Generate a fresh one:"
+                error_msg += f"\n  → https://www.strava.com/oauth/authorize?client_id={client_id}&response_type=code&redirect_uri=YOUR_REDIRECT_URI&approval_prompt=force&scope=read,activity:read_all"
+            raise RuntimeError(error_msg) from e
     else:
         # No refresh token and no auth code
-        raise RuntimeError(
-            "No valid refresh token found and no STRAVA_AUTH_CODE provided. Set STRAVA_REFRESH_TOKEN or provide STRAVA_AUTH_CODE for one-time bootstrap."
-        )
+        error_msg = "❌ Authentication failed: No valid refresh token and no STRAVA_AUTH_CODE provided.\n\n"
+        error_msg += "To fix this:\n"
+        error_msg += "1. Generate a new authorization code:\n"
+        error_msg += f"   https://www.strava.com/oauth/authorize?client_id={client_id}&response_type=code&redirect_uri=YOUR_REDIRECT_URI&approval_prompt=force&scope=read,activity:read_all\n"
+        error_msg += "2. Set STRAVA_AUTH_CODE in GitHub Secrets (one-time bootstrap)\n"
+        error_msg += "3. After successful run, update STRAVA_REFRESH_TOKEN with the new token from logs\n"
+        if refresh_token:
+            error_msg += f"\nNote: Existing refresh token failed (status {response.status_code if 'response' in locals() else 'unknown'})"
+        raise RuntimeError(error_msg)
 
 
 class TokenStore:
