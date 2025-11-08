@@ -2,40 +2,32 @@ name: Strava sync
 
 on:
   schedule:
-    - cron: "10 5 * * *"
+    - cron: "10 5 * * *"  # dagelijks 05:10 UTC
   workflow_dispatch: {}
 
 jobs:
   run-sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: |
+
+      - name: Install dependencies
+        run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests
+
       - name: Run Strava sync
         env:
           STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
           STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
           STRAVA_REFRESH_TOKEN: ${{ secrets.STRAVA_REFRESH_TOKEN }}
-          STRAVA_AUTH_CODE: ${{ secrets.STRAVA_AUTH_CODE }}
-          STRAVA_REDIRECT_URI: ${{ secrets.STRAVA_REDIRECT_URI }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          CSV_FILE: activiteiten.csv
-          JSON_FILE: activiteiten_raw.json
-          GPS_FILE: strava_gps_data.csv
-          DEBUG_LOG: debug_log.txt
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           python strava_sync.py
-      - uses: actions/upload-artifact@v4
-        with:
-          name: strava-output
-          path: |
-            activiteiten.csv
-            activiteiten_raw.json
-            strava_gps_data.csv
-            debug_log.txt
