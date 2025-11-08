@@ -15,6 +15,9 @@ STRAVA_REFRESH_TOKEN = os.environ.get("STRAVA_REFRESH_TOKEN")
 SUPABASE_TABLE = "strava_activities"
 SUPABASE: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Cache voor gear names
+GEAR_CACHE = {}
+
 # --------------------------------------------------
 # Strava OAuth refresh
 # --------------------------------------------------
@@ -35,6 +38,23 @@ def refresh_strava_token():
     return token_data["access_token"]
 
 # --------------------------------------------------
+# Gear naam ophalen met caching
+# --------------------------------------------------
+def fetch_gear_name(access_token, gear_id):
+    if not gear_id:
+        return None
+    if gear_id in GEAR_CACHE:
+        return GEAR_CACHE[gear_id]
+    url = f"https://www.strava.com/api/v3/gear/{gear_id}"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    r = requests.get(url, headers=headers)
+    if r.status_code == 200:
+        name = r.json().get("name")
+        GEAR_CACHE[gear_id] = name
+        return name
+    return None
+
+# --------------------------------------------------
 # Activiteiten ophalen
 # --------------------------------------------------
 def fetch_recent_activities(access_token, days=60):
@@ -43,28 +63,30 @@ def fetch_recent_activities(access_token, days=60):
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"per_page": 200, "page": 1}
     all_acts = []
-
+    cutoff_ts = int((requests.utils.datetime.datetime.utcnow() - requests.utils.datetime.timedelta(days=days)).timestamp())
+    
     while True:
         r = requests.get(url, headers=headers, params=params)
         r.raise_for_status()
         page_data = r.json()
         if not page_data:
             break
-        all_acts.extend(page_data)
+        # filter op cutoff date
+        filtered = [a for a in page_data if int(requests.utils.datetime.datetime.strptime(a["start_date_local"], "%Y-%m-%dT%H:%M:%S").timestamp()) >= cutoff_ts]
+        all_acts.extend(filtered)
         if len(page_data) < 200:
             break
         params["page"] += 1
-
     print(f"DEBUG: Total {len(all_acts)} activities fetched")
     return all_acts
 
 # --------------------------------------------------
-# Upload naar Supabase (alle velden)
+# Upload naar Supabase
 # --------------------------------------------------
-def upload_to_supabase(activities):
-    print("DEBUG: Uploading activities to Supabase...")
-
+def upload_to_supabase(activities, access_token):
+    print("DEBUG: Preparing activities for Supabase upload...")
     payload = []
+
     for act in activities:
         payload.append({
             "id": act.get("id"),
@@ -75,54 +97,30 @@ def upload_to_supabase(activities):
             "moving_time": act.get("moving_time"),
             "total_elevation_gain": act.get("total_elevation_gain"),
             "average_speed": act.get("average_speed"),
-            "max_speed": act.get("max_speed"),
-            "calories": act.get("calories"),
+            "start_latitude": act.get("start_latitude"),
+            "start_longitude": act.get("start_longitude"),
+            "end_latitude": act.get("end_latitude"),
+            "end_longitude": act.get("end_longitude"),
             "average_heartrate": act.get("average_heartrate"),
             "max_heartrate": act.get("max_heartrate"),
-            "has_heartrate": act.get("has_heartrate"),
-            "kudos_count": act.get("kudos_count"),
-            "comment_count": act.get("comment_count"),
-            "athlete_count": act.get("athlete_count"),
-            "photo_count": act.get("photo_count"),
+            "calories": act.get("calories"),
+            "gear_id": act.get("gear_id"),
+            "gear_name": fetch_gear_name(access_token, act.get("gear_id")),
             "trainer": act.get("trainer"),
             "commute": act.get("commute"),
             "private": act.get("private"),
-            "flagged": act.get("flagged"),
-            "gear_id": act.get("gear_id"),
-            "device_name": act.get("device_name"),
             "description": act.get("description"),
-            "map_id": act.get("map", {}).get("id"),
-            "gps_data": json.dumps(act.get("map", {}))  # of andere GPS-data
         })
 
     if not payload:
-        print("⚠️ Geen activiteiten gevonden voor upload.")
+        print("⚠️ Geen activiteiten om te uploaden")
         return
 
     try:
         SUPABASE.table(SUPABASE_TABLE).upsert(payload, on_conflict="id").execute()
-        print(f"✅ Uploaded {len(payload)} records to Supabase")
+        print(f"✅ Uploaded {len(payload)} activities to Supabase")
     except Exception as e:
         print(f"❌ ERROR: Upload to Supabase failed → {e}")
-
-# --------------------------------------------------
-# Full refresh
-# --------------------------------------------------
-def full_refresh_supabase(activities):
-    if not activities:
-        print("⚠️ Geen activiteiten gevonden voor full refresh.")
-        return
-
-    min_date = min(act["start_date_local"] for act in activities)
-    max_date = max(act["start_date_local"] for act in activities)
-
-    try:
-        SUPABASE.table(SUPABASE_TABLE).delete().gte("start_date", min_date).lte("start_date", max_date).execute()
-        print(f"DEBUG: Bestaande activiteiten van {min_date} t/m {max_date} verwijderd.")
-    except Exception as e:
-        print(f"❌ ERROR bij verwijderen bestaande records → {e}")
-
-    upload_to_supabase(activities)
 
 # --------------------------------------------------
 # Main
@@ -130,13 +128,12 @@ def full_refresh_supabase(activities):
 def main():
     token = refresh_strava_token()
     activities = fetch_recent_activities(token, days=60)
-
-    # Opslaan van raw JSON voor debugging
+    
+    # Raw JSON voor debugging
     with open("activiteiten_raw.json", "w") as f:
         json.dump(activities, f, indent=2)
-
-    # Full refresh naar Supabase
-    full_refresh_supabase(activities)
+    
+    upload_to_supabase(activities, token)
     print("DEBUG: Sync afgerond ✅")
 
 if __name__ == "__main__":
