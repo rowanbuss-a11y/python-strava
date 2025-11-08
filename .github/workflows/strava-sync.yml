@@ -28,12 +28,11 @@ jobs:
           STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
           STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
           STRAVA_REFRESH_TOKEN: ${{ secrets.STRAVA_REFRESH_TOKEN }}
-          STRAVA_AUTH_CODE: ${{ secrets.STRAVA_AUTH_CODE }}
-          STRAVA_REDIRECT_URI: ${{ secrets.STRAVA_REDIRECT_URI }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           CSV_FILE: activiteiten.csv
           JSON_FILE: activiteiten_raw.json
+          DAYS_BACK: 30
         run: python strava_sync.py
 
       - name: Upload artifacts
