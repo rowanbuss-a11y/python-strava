@@ -2,7 +2,7 @@ name: Strava sync
 
 on:
   schedule:
-    - cron: "10 5 * * *"  # Dagelijks om 05:10 UTC
+    - cron: "10 5 * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -20,16 +20,25 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install -r requirements.txt
+          pip install psycopg2-binary requests
 
       - name: Run Strava sync
         env:
           STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
           STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
           STRAVA_REFRESH_TOKEN: ${{ secrets.STRAVA_REFRESH_TOKEN }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python strava_sync.py
+          STRAVA_AUTH_CODE: ${{ secrets.STRAVA_AUTH_CODE }}
+          STRAVA_REDIRECT_URI: ${{ secrets.STRAVA_REDIRECT_URI }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          CSV_FILE: activiteiten.csv
+          JSON_FILE: activiteiten_raw.json
+        run: |
+          python strava_sync.py
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
