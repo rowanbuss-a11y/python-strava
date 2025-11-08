@@ -4,175 +4,191 @@ import time
 import json
 import csv
 from datetime import datetime, timedelta
+from supabase import create_client, Client
 
-# Environment variables
-CLIENT_ID = os.environ["STRAVA_CLIENT_ID"]
-CLIENT_SECRET = os.environ["STRAVA_CLIENT_SECRET"]
-REFRESH_TOKEN = os.environ["STRAVA_REFRESH_TOKEN"]
-ACCESS_TOKEN_FILE = "access_token.json"
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+SUPABASE_TABLE = "strava_activities"
+
+STRAVA_CLIENT_ID = os.environ["STRAVA_CLIENT_ID"]
+STRAVA_CLIENT_SECRET = os.environ["STRAVA_CLIENT_SECRET"]
+STRAVA_REFRESH_TOKEN = os.environ["STRAVA_REFRESH_TOKEN"]
+
 CSV_FILE = os.environ.get("CSV_FILE", "activiteiten.csv")
 JSON_FILE = os.environ.get("JSON_FILE", "activiteiten_raw.json")
-DAYS_BACK = 60  # Historie van 60 dagen
+DAYS_BACK = 60
 
-# Cache voor gear requests
+SUPABASE: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
 gear_cache = {}
 
-def save_access_token(token_data):
-    with open(ACCESS_TOKEN_FILE, "w") as f:
-        json.dump(token_data, f)
 
-def load_access_token():
-    if os.path.exists(ACCESS_TOKEN_FILE):
-        with open(ACCESS_TOKEN_FILE) as f:
-            return json.load(f)
-    return None
-
+# --------------------------------------------------
+# TOKEN MANAGEMENT
+# --------------------------------------------------
 def refresh_access_token():
-    data = {
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "refresh_token",
-        "refresh_token": REFRESH_TOKEN
-    }
-    r = requests.post("https://www.strava.com/oauth/token", data=data)
+    """Vernieuwt Strava access token via refresh token."""
+    r = requests.post(
+        "https://www.strava.com/api/v3/oauth/token",
+        data={
+            "client_id": STRAVA_CLIENT_ID,
+            "client_secret": STRAVA_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": STRAVA_REFRESH_TOKEN,
+        },
+    )
     r.raise_for_status()
     token_data = r.json()
-    save_access_token(token_data)
+    print("✅ Nieuw access token opgehaald")
     return token_data["access_token"]
 
-def get_valid_access_token():
-    token_data = load_access_token()
-    if token_data:
-        expires_at = token_data.get("expires_at", 0)
-        if expires_at > time.time():
-            return token_data["access_token"]
-    return refresh_access_token()
 
+# --------------------------------------------------
+# GEAR DETAILS
+# --------------------------------------------------
 def get_gear_name(access_token, gear_id):
-    """Haalt gear name op via Strava API en cache het."""
+    """Haalt de gear name op, met caching."""
     if not gear_id:
         return None
     if gear_id in gear_cache:
         return gear_cache[gear_id]
-    
+
     url = f"https://www.strava.com/api/v3/gear/{gear_id}"
     headers = {"Authorization": f"Bearer {access_token}"}
-    
-    for _ in range(3):  # retry bij tijdelijke fouten
-        r = requests.get(url, headers=headers)
-        if r.status_code == 200:
-            data = r.json()
-            gear_name = data.get("name")
-            gear_cache[gear_id] = gear_name
-            return gear_name
-        elif r.status_code == 429:  # rate limit
-            print("Rate limit gear bereikt, wacht 30 sec...")
-            time.sleep(30)
-        else:
-            print(f"Fout bij ophalen gear {gear_id}: {r.status_code}")
-            return None
-    return None
+    r = requests.get(url, headers=headers)
 
-def prepare_activity_row(activity, access_token):
-    gear_id = activity.get("gear_id")
-    gear_name = activity.get("gear", {}).get("name") or get_gear_name(access_token, gear_id)
+    if r.status_code == 404:
+        print(f"⚠️ Gear niet gevonden: {gear_id}")
+        gear_cache[gear_id] = None
+        return None
+    elif r.status_code == 429:
+        print("⏳ Rate limit bereikt bij gear-oproep — 30 sec wachten...")
+        time.sleep(30)
+        return get_gear_name(access_token, gear_id)
 
-    row = {
-        "ID": activity.get("id"),
-        "Naam": activity.get("name"),
-        "Datum": activity.get("start_date"),
-        "Type": activity.get("type"),
-        "Afstand (km)": round(activity.get("distance", 0) / 1000, 2),
-        "Tijd (min)": round(activity.get("moving_time", 0) / 60, 2),
-        "Totale tijd (min)": round(activity.get("elapsed_time", 0) / 60, 2),
-        "Hoogtemeters": activity.get("total_elevation_gain", 0),
-        "Gemiddeld vermogen (W)": activity.get("average_watts"),
-        "Calorieën": activity.get("calories"),
-        "Gear ID": gear_id,
-        "Gear naam": gear_name,
-        "Heart Rate Gemiddeld": activity.get("average_heartrate"),
-        "Heart Rate Max": activity.get("max_heartrate"),
-        "Snelheid Gemiddeld (km/u)": round((activity.get("average_speed", 0) * 3.6), 2),
-        "Snelheid Max (km/u)": round((activity.get("max_speed", 0) * 3.6), 2),
-        "Polyline": activity.get("map", {}).get("polyline")
-    }
-    return row
+    r.raise_for_status()
+    gear_name = r.json().get("name")
+    gear_cache[gear_id] = gear_name
+    return gear_name
 
+
+# --------------------------------------------------
+# ACTIVITEITEN OPHALEN
+# --------------------------------------------------
 def get_activities(access_token, after_timestamp):
+    """Haalt activiteiten op vanaf een bepaalde datum."""
     activities = []
     page = 1
     while True:
         url = f"https://www.strava.com/api/v3/athlete/activities?page={page}&per_page=200&after={after_timestamp}"
         headers = {"Authorization": f"Bearer {access_token}"}
         r = requests.get(url, headers=headers)
+
         if r.status_code == 429:
-            print("Rate limit activiteiten bereikt, wachten 30 sec...")
+            print("⏳ Rate limit bereikt, 30 sec wachten...")
             time.sleep(30)
             continue
+
         r.raise_for_status()
-        batch = r.json()
-        if not batch:
+        data = r.json()
+        if not data:
             break
-        activities.extend(batch)
+        activities.extend(data)
         page += 1
+    print(f"📦 {len(activities)} activiteiten opgehaald")
     return activities
 
-def load_existing_ids():
-    existing_ids = set()
-    if os.path.exists(CSV_FILE):
-        with open(CSV_FILE, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                existing_ids.add(int(row["ID"]))
-    return existing_ids
 
-def main():
-    access_token = get_valid_access_token()
-    after_date = datetime.now() - timedelta(days=DAYS_BACK)
-    after_timestamp = int(after_date.timestamp())
+# --------------------------------------------------
+# CONVERSIE NAAR STRUCTUUR
+# --------------------------------------------------
+def prepare_activity(activity, access_token):
+    """Converteert Strava-activiteit naar opslagformaat."""
+    gear_id = activity.get("gear_id")
+    gear_name = get_gear_name(access_token, gear_id)
 
-    existing_ids = load_existing_ids()
-    print(f"Bestaande activiteiten: {len(existing_ids)}")
+    return {
+        "id": activity.get("id"),
+        "name": activity.get("name"),
+        "type": activity.get("type"),
+        "start_date": activity.get("start_date"),
+        "distance_km": round(activity.get("distance", 0) / 1000, 2),
+        "moving_time_min": round(activity.get("moving_time", 0) / 60, 2),
+        "elevation_gain": activity.get("total_elevation_gain"),
+        "average_watts": activity.get("average_watts"),
+        "calories": activity.get("calories"),
+        "gear_id": gear_id,
+        "gear_name": gear_name,
+        "average_heartrate": activity.get("average_heartrate"),
+        "max_heartrate": activity.get("max_heartrate"),
+        "average_speed_kmh": round(activity.get("average_speed", 0) * 3.6, 2),
+        "max_speed_kmh": round(activity.get("max_speed", 0) * 3.6, 2),
+        "map_polyline": activity.get("map", {}).get("polyline"),
+    }
 
-    activities = get_activities(access_token, after_timestamp)
-    print(f"Opgehaalde activiteiten: {len(activities)}")
 
-    new_rows = []
-    for act in activities:
-        if act["id"] in existing_ids:
-            continue
-        row = prepare_activity_row(act, access_token)
-        new_rows.append(row)
+# --------------------------------------------------
+# SUPABASE UPLOAD
+# --------------------------------------------------
+def upload_to_supabase(rows):
+    """Uploadt nieuwe activiteiten naar Supabase."""
+    if not rows:
+        print("⚠️ Geen nieuwe activiteiten om te uploaden.")
+        return
 
-    if not new_rows:
-        print("Geen nieuwe activiteiten gevonden.")
+    try:
+        SUPABASE.table(SUPABASE_TABLE).upsert(rows, on_conflict="id").execute()
+        print(f"✅ {len(rows)} activiteiten geüpload naar Supabase")
+    except Exception as e:
+        print(f"❌ Upload naar Supabase mislukt: {e}")
+
+
+# --------------------------------------------------
+# CSV OPSLAG (backup)
+# --------------------------------------------------
+def save_to_csv_and_json(rows):
+    if not rows:
         return
 
     # JSON opslaan
-    all_json = []
-    if os.path.exists(JSON_FILE):
-        with open(JSON_FILE) as f:
-            all_json = json.load(f)
-    all_json.extend(new_rows)
-    with open(JSON_FILE, "w") as f:
-        json.dump(all_json, f, indent=2)
+    with open(JSON_FILE, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2)
 
     # CSV opslaan
-    if os.path.exists(CSV_FILE):
-        with open(CSV_FILE, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            all_rows = list(reader)
-    else:
-        all_rows = []
-
-    all_rows.extend(new_rows)
-    keys = all_rows[0].keys()
+    keys = rows[0].keys()
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
-        writer.writerows(all_rows)
+        writer.writerows(rows)
+    print(f"💾 Data opgeslagen in {CSV_FILE} en {JSON_FILE}")
 
-    print(f"Succesvol {len(new_rows)} nieuwe activiteiten toegevoegd aan CSV en JSON.")
+
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
+def main():
+    access_token = refresh_access_token()
+
+    after_date = datetime.utcnow() - timedelta(days=DAYS_BACK)
+    after_timestamp = int(after_date.timestamp())
+
+    print(f"⏱ Ophalen activiteiten vanaf: {after_date.strftime('%Y-%m-%d')}")
+    activities = get_activities(access_token, after_timestamp)
+
+    # Data voorbereiden
+    rows = [prepare_activity(a, access_token) for a in activities]
+
+    # Upload naar Supabase
+    upload_to_supabase(rows)
+
+    # Backup lokaal opslaan
+    save_to_csv_and_json(rows)
+
+    print("✅ Sync volledig afgerond.")
+
 
 if __name__ == "__main__":
     main()
