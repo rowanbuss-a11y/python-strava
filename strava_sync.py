@@ -1,220 +1,246 @@
-import requests
-import csv
 import os
+import requests
 import json
+import csv
 import time
-import socket
-from datetime import datetime, timedelta
 import polyline
+from datetime import datetime, timedelta
 import psycopg2
 from psycopg2.extras import execute_values
-from contextlib import closing
 
-# --------------------------
-# STRAVA AUTHENTICATIE
-# --------------------------
+# =========================================
+# Strava Authentication Manager
+# =========================================
 class StravaAuthManager:
-    CLIENT_ID = "129018"
-    CLIENT_SECRET = "69d0ce2fdd3cdfc33b037b5e43d3f9f3faf0eed4"
-    TOKEN_FILE = "/Users/rowanbuss/Desktop/STRAVA NIEUW/strava_tokens.json"
-    
     def __init__(self):
-        self.REDIRECT_URI = f"http://127.0.0.1:{self.find_free_port()}"
-    
-    def find_free_port(self):
-        for port in range(8080, 8091):
-            with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-                try:
-                    sock.bind(('127.0.0.1', port))
-                    return port
-                except OSError:
-                    continue
-        raise OSError("Geen vrije poort gevonden tussen 8080 en 8090")
-    
-    def load_tokens(self):
-        if os.path.exists(self.TOKEN_FILE):
-            with open(self.TOKEN_FILE, 'r') as f:
-                return json.load(f)
-        return None
-    
-    def save_tokens(self, tokens):
-        os.makedirs(os.path.dirname(self.TOKEN_FILE), exist_ok=True)
-        with open(self.TOKEN_FILE, 'w') as f:
-            json.dump(tokens, f)
-    
-    def refresh_access_token(self, refresh_token):
-        url = "https://www.strava.com/oauth/token"
-        payload = {
-            "client_id": self.CLIENT_ID,
-            "client_secret": self.CLIENT_SECRET,
-            "refresh_token": refresh_token,
-            "grant_type": "refresh_token"
-        }
-        response = requests.post(url, data=payload)
-        response.raise_for_status()
-        tokens = response.json()
-        tokens['expires_at'] = datetime.now().timestamp() + tokens['expires_in']
-        self.save_tokens(tokens)
-        return tokens
-    
-    def get_valid_access_token(self):
-        tokens = self.load_tokens()
-        if not tokens:
-            raise Exception("Geen tokens gevonden. Voer eerst eenmalig handmatige authenticatie uit.")
-        if datetime.now().timestamp() >= tokens['expires_at'] - 60:
-            print("Access token verlopen, vernieuwen...")
-            tokens = self.refresh_access_token(tokens['refresh_token'])
-        return tokens['access_token']
+        self.CLIENT_ID = os.getenv("STRAVA_CLIENT_ID")
+        self.CLIENT_SECRET = os.getenv("STRAVA_CLIENT_SECRET")
+        self.REFRESH_TOKEN = os.getenv("STRAVA_REFRESH_TOKEN")
+        self.token_file = os.getenv("STRAVA_TOKEN_FILE", "strava_tokens.json")
+        self.access_token = None
 
-# --------------------------
-# STRAVA DATA MANAGER
-# --------------------------
+    def get_valid_access_token(self):
+        # Gebruik token in memory als die bestaat
+        if self.access_token:
+            return self.access_token
+
+        # Ververs token via refresh token
+        if self.REFRESH_TOKEN:
+            url = "https://www.strava.com/oauth/token"
+            payload = {
+                "client_id": self.CLIENT_ID,
+                "client_secret": self.CLIENT_SECRET,
+                "refresh_token": self.REFRESH_TOKEN,
+                "grant_type": "refresh_token"
+            }
+            response = requests.post(url, data=payload)
+            response.raise_for_status()
+            tokens = response.json()
+            self.access_token = tokens['access_token']
+            # update REFRESH_TOKEN voor volgende run
+            self.REFRESH_TOKEN = tokens.get('refresh_token', self.REFRESH_TOKEN)
+            return self.access_token
+
+        # fallback op lokaal tokenbestand
+        if os.path.exists(self.token_file):
+            with open(self.token_file, 'r') as f:
+                tokens = json.load(f)
+            self.access_token = tokens['access_token']
+            return self.access_token
+
+        raise Exception("Geen tokens gevonden. Zet STRAVA_REFRESH_TOKEN als secret in GitHub Actions")
+
+
+# =========================================
+# Strava Data Manager
+# =========================================
 class StravaDataManager:
-    CSV_FILE = "/Users/rowanbuss/Desktop/STRAVA NIEUW/activiteiten.csv"
-    JSON_FILE = "/Users/rowanbuss/Desktop/STRAVA NIEUW/activiteiten_raw.json"
-    GPS_FILE = "/Users/rowanbuss/Desktop/STRAVA NIEUW/strava_gps_data.csv"
-    DETAILS_FILE = "/Users/rowanbuss/Desktop/STRAVA NIEUW/existing_details.json"
-    
     def __init__(self):
         self.auth = StravaAuthManager()
         self.access_token = self.auth.get_valid_access_token()
-        os.makedirs(os.path.dirname(self.CSV_FILE), exist_ok=True)
-        self.existing_details = self.load_existing_details()
-    
-    def debug_log(self, msg):
-        print(f"[DEBUG {datetime.now().isoformat()}] {msg}")
-    
+        self.csv_file = os.getenv("CSV_FILE", "activiteiten.csv")
+        self.json_file = os.getenv("JSON_FILE", "activiteiten_raw.json")
+        self.debug_file = os.getenv("DEBUG_FILE", "debug_log.txt")
+        self.gps_file = os.getenv("GPS_FILE", "strava_gps_data.csv")
+        self.existing_details_file = os.getenv("EXISTING_DETAILS_FILE", "existing_details.json")
+
+        # Database config (Supabase/PostgreSQL)
+        self.db_config = {
+            'dbname': os.getenv("DB_NAME", "postgres"),
+            'user': os.getenv("DB_USER", "postgres"),
+            'password': os.getenv("DB_PASSWORD"),
+            'host': os.getenv("DB_HOST"),
+            'port': os.getenv("DB_PORT", 5432)
+        }
+
+        self.debug_log("StravaDataManager initialized.")
+
+    # =========================================
+    # Debug log
+    # =========================================
+    def debug_log(self, message):
+        timestamp = datetime.now().isoformat()
+        with open(self.debug_file, 'a', encoding='utf-8') as f:
+            f.write(f"{timestamp} - {message}\n")
+        print(f"DEBUG: {message}")
+
+    # =========================================
+    # Haal bestaande details op
+    # =========================================
     def load_existing_details(self):
-        if os.path.exists(self.DETAILS_FILE):
-            with open(self.DETAILS_FILE, 'r') as f:
-                return {str(k): v for k, v in json.load(f).items()}
+        if os.path.exists(self.existing_details_file):
+            try:
+                with open(self.existing_details_file, 'r') as f:
+                    data = json.load(f)
+                    return {str(k): v for k, v in data.items()}
+            except:
+                return {}
         return {}
-    
-    def save_existing_details(self):
-        with open(self.DETAILS_FILE, 'w') as f:
-            json.dump(self.existing_details, f)
-    
-    def get_existing_ids(self):
-        ids = set()
-        if os.path.exists(self.CSV_FILE):
-            with open(self.CSV_FILE, 'r', encoding='utf-8') as f:
-                for row in csv.DictReader(f):
-                    ids.add(row['ID'])
-        return ids
-    
-    def get_last_activity_date(self):
-        if not os.path.exists(self.CSV_FILE):
-            return None
-        dates = []
-        with open(self.CSV_FILE, 'r', encoding='utf-8') as f:
-            for row in csv.DictReader(f):
-                try:
-                    dates.append(datetime.strptime(row['Datum'], "%Y-%m-%dT%H:%M:%SZ"))
-                except:
-                    continue
-        return max(dates) if dates else None
-    
-    def fetch_activities_summary(self, last_date=None):
+
+    def save_existing_details(self, details_dict):
+        with open(self.existing_details_file, 'w') as f:
+            json.dump(details_dict, f)
+
+    # =========================================
+    # Haal activiteiten op van Strava
+    # =========================================
+    def get_activities(self, page=1, per_page=200):
         all_activities = []
-        page = 1
-        existing_ids = self.get_existing_ids()
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+
         while True:
-            params = {"page": page, "per_page": 200}
-            if last_date:
-                params['after'] = int(last_date.timestamp())
-            resp = requests.get("https://www.strava.com/api/v3/athlete/activities",
-                                headers={"Authorization": f"Bearer {self.access_token}"},
-                                params=params)
-            if resp.status_code != 200:
+            url = "https://www.strava.com/api/v3/athlete/activities"
+            params = {"page": page, "per_page": per_page}
+            response = requests.get(url, headers=headers, params=params)
+            if response.status_code != 200:
+                self.debug_log(f"Fout bij ophalen activiteiten: {response.text}")
                 break
-            activities = resp.json()
+            activities = response.json()
             if not activities:
                 break
-            new_activities = [a for a in activities if str(a['id']) not in existing_ids]
-            all_activities.extend(new_activities)
+            all_activities.extend(activities)
             page += 1
-        self.debug_log(f"Fetched {len(all_activities)} new activities (summary)")
+
+        self.debug_log(f"Totaal {len(all_activities)} activiteiten opgehaald.")
         return all_activities
-    
-    def fetch_activity_details(self, activity_id):
-        if str(activity_id) in self.existing_details:
-            return self.existing_details[str(activity_id)]
+
+    # =========================================
+    # Haal gedetailleerde data op per activiteit
+    # =========================================
+    def get_activity_details(self, activity_id):
+        headers = {"Authorization": f"Bearer {self.access_token}"}
         url = f"https://www.strava.com/api/v3/activities/{activity_id}"
-        resp = requests.get(url, headers={"Authorization": f"Bearer {self.access_token}"}, params={"include_all_efforts": True})
-        if resp.status_code == 200:
-            data = resp.json()
-            self.existing_details[str(activity_id)] = data
-            return data
-        self.debug_log(f"Failed to fetch details for {activity_id}")
-        return None
-    
-    def merge_summary_with_details(self, summaries):
-        activities = []
-        for s in summaries:
-            details = self.fetch_activity_details(s['id'])
-            if details:
-                merged = {**s, **details}
-            else:
-                merged = s
-            activities.append(merged)
-        self.save_existing_details()
-        return activities
-    
-    def save_to_csv(self, activities):
-        if not activities:
-            return
-        fieldnames = list(self._prepare_row(activities[0]).keys())
-        file_exists = os.path.exists(self.CSV_FILE)
-        with open(self.CSV_FILE, 'a' if file_exists else 'w', newline='', encoding='utf-8') as f:
+        params = {"include_all_efforts": True}
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            self.debug_log(f"Fout bij ophalen details {activity_id}: {response.text}")
+            return None
+
+    # =========================================
+    # Voorbereiden CSV rij
+    # =========================================
+    def _prepare_activity_row(self, activity):
+        gear = activity.get('gear', {}) if isinstance(activity.get('gear'), dict) else {}
+        row = {
+            "ID": activity.get('id'),
+            "Naam": activity.get('name'),
+            "Datum": activity.get('start_date'),
+            "Type": activity.get('type'),
+            "Afstand (km)": round(activity.get('distance', 0)/1000,2),
+            "Tijd (min)": round(activity.get('moving_time',0)/60,2),
+            "Totale tijd (min)": round(activity.get('elapsed_time',0)/60,2),
+            "Hoogtemeters": activity.get('total_elevation_gain',0),
+            "Calorieën": activity.get('calories'),
+            "Gear naam": gear.get('name'),
+            "Start_lat": activity.get('start_latitude'),
+            "Start_lng": activity.get('start_longitude')
+        }
+        return row
+
+    # =========================================
+    # Opslaan in CSV
+    # =========================================
+    def save_activities_to_csv(self, activities):
+        fieldnames = list(self._prepare_activity_row(activities[0]).keys())
+        file_exists = os.path.exists(self.csv_file)
+        with open(self.csv_file, mode='a', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             if not file_exists:
                 writer.writeheader()
             for act in activities:
-                writer.writerow(self._prepare_row(act))
-        self.debug_log(f"Saved {len(activities)} activities to CSV")
-    
-    def save_gps_csv(self, activities):
-        with open(self.GPS_FILE, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['ActivityID','ActivityName','Latitude','Longitude','Timestamp'])
+                writer.writerow(self._prepare_activity_row(act))
+        self.debug_log(f"{len(activities)} activiteiten opgeslagen in CSV.")
+
+    # =========================================
+    # Opslaan GPS data
+    # =========================================
+    def save_gps_data(self, activities):
+        with open(self.gps_file, mode='w', newline='', encoding='utf-8') as f:
+            fieldnames = ['ActivityID','Latitude','Longitude']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for act in activities:
-                if 'map' in act and act['map'].get('summary_polyline'):
-                    points = polyline.decode(act['map']['summary_polyline'])
-                    start_time = datetime.strptime(act['start_date'], "%Y-%m-%dT%H:%M:%SZ")
-                    for idx, (lat, lng) in enumerate(points):
+                map_data = act.get('map', {})
+                if 'summary_polyline' in map_data:
+                    points = polyline.decode(map_data['summary_polyline'])
+                    for lat,lng in points:
                         writer.writerow({
-                            'ActivityID': act['id'],
-                            'ActivityName': act['name'],
+                            'ActivityID': act.get('id'),
                             'Latitude': lat,
-                            'Longitude': lng,
-                            'Timestamp': (start_time + timedelta(seconds=idx)).isoformat()
+                            'Longitude': lng
                         })
-        self.debug_log(f"Saved GPS data to CSV")
-    
-    def _prepare_row(self, act):
-        gear_name = act.get('gear', {}).get('name') if isinstance(act.get('gear'), dict) else None
-        return {
-            'ID': act.get('id'),
-            'Naam': act.get('name'),
-            'Datum': act.get('start_date'),
-            'Type': act.get('type'),
-            'Afstand (km)': round(act.get('distance', 0)/1000,2),
-            'Tijd (min)': round(act.get('moving_time',0)/60,2),
-            'Calorieën': act.get('calories'),
-            'Gear naam': gear_name
-        }
-    
-    def sync(self):
-        last_date = self.get_last_activity_date()
-        summaries = self.fetch_activities_summary(last_date)
-        full_activities = self.merge_summary_with_details(summaries)
-        self.save_to_csv(full_activities)
-        self.save_gps_csv(full_activities)
-        self.debug_log("Sync voltooid ✅")
+        self.debug_log("GPS data opgeslagen.")
 
-# --------------------------
-# RUN SYNC
-# --------------------------
+    # =========================================
+    # Opslaan in Supabase/Postgres
+    # =========================================
+    def save_to_database(self, activities):
+        try:
+            with psycopg2.connect(**self.db_config) as conn:
+                with conn.cursor() as cur:
+                    for act in activities:
+                        cur.execute("""
+                            INSERT INTO strava_activities (id, name, type, start_date, distance, moving_time, calories, gear_name)
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (id) DO UPDATE SET
+                            name=EXCLUDED.name, type=EXCLUDED.type, distance=EXCLUDED.distance,
+                            moving_time=EXCLUDED.moving_time, calories=EXCLUDED.calories, gear_name=EXCLUDED.gear_name
+                        """, (
+                            act.get('id'), act.get('name'), act.get('type'), act.get('start_date'),
+                            act.get('distance'), act.get('moving_time'), act.get('calories'),
+                            (act.get('gear', {}) or {}).get('name')
+                        ))
+                    conn.commit()
+            self.debug_log(f"{len(activities)} activiteiten opgeslagen in database.")
+        except Exception as e:
+            self.debug_log(f"Fout bij opslaan in database: {e}")
+
+    # =========================================
+    # Main functie
+    # =========================================
+    def run(self):
+        self.debug_log("Start ophalen Strava activiteiten...")
+        summary_activities = self.get_activities()
+        detailed_activities = []
+
+        for act in summary_activities:
+            detail = self.get_activity_details(act['id'])
+            if detail:
+                detailed_activities.append(detail)
+            else:
+                detailed_activities.append(act)
+
+        self.save_activities_to_csv(detailed_activities)
+        self.save_gps_data(detailed_activities)
+        self.save_to_database(detailed_activities)
+        self.debug_log("Sync afgerond ✅")
+
+
+# =========================================
+# Start script
+# =========================================
 if __name__ == "__main__":
     manager = StravaDataManager()
-    manager.sync()
+    manager.run()
