@@ -1,108 +1,83 @@
 import os
-import requests
-import datetime
+import csv
 import json
-
-# ==============
-# CONFIG
-# ==============
-
-STRAVA_API_URL = "https://www.strava.com/api/v3"
+import time
+import requests
+from datetime import datetime, timedelta
 
 
-# ==========================
-# TOKEN MANAGEMENT
-# ==========================
+def get_env(name, required=True, default=None):
+    value = os.environ.get(name, default)
+    if required and not value:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return value
 
-def refresh_access_token():
-    """Vernieuw het Strava access token met de refresh token"""
-    client_id = os.environ.get("STRAVA_CLIENT_ID")
-    client_secret = os.environ.get("STRAVA_CLIENT_SECRET")
-    refresh_token = os.environ.get("STRAVA_REFRESH_TOKEN")
 
-    if not all([client_id, client_secret, refresh_token]):
-        raise ValueError("Strava clientgegevens ontbreken in environment variables")
+def get_access_token():
+    """Gebruik refresh token om nieuw access token op te halen"""
+    client_id = get_env("STRAVA_CLIENT_ID")
+    client_secret = get_env("STRAVA_CLIENT_SECRET")
+    refresh_token = get_env("STRAVA_REFRESH_TOKEN")
 
     response = requests.post(
-        "https://www.strava.com/api/v3/oauth/token",
+        "https://www.strava.com/oauth/token",
         data={
             "client_id": client_id,
             "client_secret": client_secret,
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
         },
+        timeout=30,
     )
+    response.raise_for_status()
+    data = response.json()
+    print("DEBUG: Nieuw access token verkregen")
+    return data["access_token"]
 
-    if response.status_code != 200:
-        raise RuntimeError(f"Kon access token niet vernieuwen: {response.text}")
-
-    token_data = response.json()
-    print("DEBUG: New refresh token - update STRAVA_REFRESH_TOKEN Secret")
-    return token_data["access_token"]
-
-
-# ==========================
-# FETCH ACTIVITIES
-# ==========================
 
 def fetch_recent_activities(access_token, days=30):
-    """Haal activiteiten van de afgelopen X dagen op"""
-    after_date = datetime.datetime.utcnow() - datetime.timedelta(days=days)
-    after_timestamp = int(after_date.timestamp())
-
-    headers = {"Authorization": f"Bearer {access_token}"}
+    """Haal Strava activiteiten op van de laatste X dagen"""
+    activities = []
+    after = int((datetime.now() - timedelta(days=days)).timestamp())
     page = 1
-    all_activities = []
-
-    print(f"DEBUG: Fetching activities from last {days} days (after {after_date.date()})")
-
     while True:
-        params = {"after": after_timestamp, "page": page, "per_page": 100}
-        r = requests.get(f"{STRAVA_API_URL}/athlete/activities", headers=headers, params=params)
-
-        if r.status_code == 401:
-            raise RuntimeError("401 Unauthorized - token may be invalid")
-
-        activities = r.json()
-        if not activities:
+        r = requests.get(
+            "https://www.strava.com/api/v3/athlete/activities",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"per_page": 200, "page": page, "after": after},
+            timeout=60,
+        )
+        if r.status_code == 429:
+            time.sleep(60)
+            continue
+        r.raise_for_status()
+        page_data = r.json()
+        if not page_data:
             break
-
-        print(f"DEBUG: Page {page}: {len(activities)} activities")
-        all_activities.extend(activities)
+        activities.extend(page_data)
+        print(f"DEBUG: Pagina {page} → {len(page_data)} activiteiten")
         page += 1
+    print(f"DEBUG: Totaal {len(activities)} activiteiten opgehaald")
+    return activities
 
-    print(f"DEBUG: Total: {len(all_activities)} activities")
-    return all_activities
-
-
-# ==========================
-# SAVE TO SUPABASE
-# ==========================
 
 def save_to_supabase(activities):
-    """Sla Strava-data op in Supabase via de REST API"""
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-    table = os.environ.get("SUPABASE_TABLE", "strava_activities")
-
-    if not url or not key:
-        print("DEBUG: Supabase API niet geconfigureerd, skip upload")
+    """Sla activiteiten rechtstreeks op in Supabase via REST API"""
+    if not activities:
+        print("DEBUG: Geen activiteiten om op te slaan")
         return
 
+    url = f"{get_env('SUPABASE_URL')}/rest/v1/strava_activities"
     headers = {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
+        "apikey": get_env("SUPABASE_SERVICE_ROLE_KEY"),
+        "Authorization": f"Bearer {get_env('SUPABASE_SERVICE_ROLE_KEY')}",
         "Content-Type": "application/json",
-        "Prefer": "resolution=merge-duplicates"
+        "Prefer": "resolution=merge-duplicates",
     }
 
-    endpoint = f"{url}/rest/v1/{table}"
-
-    rows = []
+    payload = []
     for act in activities:
-        start_latlng = act.get("start_latlng", [])
-        end_latlng = act.get("end_latlng", [])
-        rows.append({
+        payload.append({
             "id": act.get("id"),
             "name": act.get("name"),
             "type": act.get("type"),
@@ -115,57 +90,49 @@ def save_to_supabase(activities):
             "max_speed": act.get("max_speed"),
             "average_heartrate": act.get("average_heartrate"),
             "max_heartrate": act.get("max_heartrate"),
-            "start_latitude": start_latlng[0] if start_latlng else None,
-            "start_longitude": start_latlng[1] if len(start_latlng) > 1 else None,
-            "end_latitude": end_latlng[0] if end_latlng else None,
-            "end_longitude": end_latlng[1] if len(end_latlng) > 1 else None,
             "timezone": act.get("timezone"),
             "utc_offset": act.get("utc_offset"),
-            "kudos_count": act.get("kudos_count", 0),
-            "comment_count": act.get("comment_count", 0),
-            "gear_id": act.get("gear_id"),
-            "trainer": act.get("trainer", False),
-            "commute": act.get("commute", False),
-            "private": act.get("private", False),
+            "kudos_count": act.get("kudos_count"),
+            "comment_count": act.get("comment_count"),
+            "commute": act.get("commute"),
+            "trainer": act.get("trainer"),
+            "private": act.get("private"),
             "description": act.get("description"),
         })
 
-    r = requests.post(endpoint, headers=headers, json=rows, timeout=60)
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
     if r.status_code not in (200, 201, 204):
-        print(f"DEBUG: Supabase insert failed ({r.status_code}): {r.text[:500]}")
+        print(f"DEBUG: Fout bij upload: {r.status_code} {r.text[:300]}")
     else:
-        print(f"DEBUG: Saved {len(rows)} activities to Supabase")
+        print(f"DEBUG: {len(activities)} activiteiten naar Supabase geüpload")
 
 
-# ==========================
-# SAVE LOCAL FILES
-# ==========================
-
-def save_local(activities):
-    with open("activiteiten_raw.json", "w") as f:
-        json.dump(activities, f, indent=2)
-    print(f"DEBUG: Saved {len(activities)} activities to activiteiten_raw.json")
-
-    import csv
-    with open("activiteiten.csv", "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["id", "name", "type", "distance", "start_date"])
+def save_to_csv(activities, filename):
+    """Sla activiteiten ook lokaal op als CSV"""
+    if not activities:
+        return
+    fieldnames = ["id", "name", "type", "start_date", "distance", "moving_time"]
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
         for a in activities:
-            writer.writerow([a.get("id"), a.get("name"), a.get("type"), a.get("distance"), a.get("start_date")])
-    print(f"DEBUG: Saved {len(activities)} new activities to activiteiten.csv")
+            writer.writerow({k: a.get(k) for k in fieldnames})
+    print(f"DEBUG: {len(activities)} activiteiten opgeslagen in {filename}")
 
 
-# ==========================
-# MAIN
-# ==========================
+def save_to_json(activities, filename):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(activities, f, indent=2)
+    print(f"DEBUG: {len(activities)} activiteiten opgeslagen in {filename}")
+
 
 def main():
-    print("DEBUG: Start sync - laatste 30 dagen")
-    access_token = refresh_access_token()
-    activities = fetch_recent_activities(access_token)
-    save_local(activities)
+    token = get_access_token()
+    activities = fetch_recent_activities(token, days=30)
     save_to_supabase(activities)
-    print("DEBUG: Sync gereed")
+    save_to_csv(activities, "activiteiten.csv")
+    save_to_json(activities, "activiteiten_raw.json")
+    print("DEBUG: Sync afgerond ✅")
 
 
 if __name__ == "__main__":
