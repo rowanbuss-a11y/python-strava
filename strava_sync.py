@@ -1,117 +1,105 @@
 import os
 import requests
 import json
-import datetime
-import logging
 from supabase import create_client, Client
 
-# === Logging instellen ===
-logging.basicConfig(level=logging.DEBUG, format="DEBUG: %(message)s")
+# --------------------------------------------------
+# Configuratie
+# --------------------------------------------------
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+STRAVA_CLIENT_ID = os.environ.get("STRAVA_CLIENT_ID")
+STRAVA_CLIENT_SECRET = os.environ.get("STRAVA_CLIENT_SECRET")
+STRAVA_REFRESH_TOKEN = os.environ.get("STRAVA_REFRESH_TOKEN")
 
-# === Hulpfunctie om omgevingsvariabelen op te halen ===
-def env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
+SUPABASE_TABLE = "strava_activities"
+SUPABASE: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# === Supabase client ===
-def get_supabase() -> Client:
-    supabase_url = env("SUPABASE_URL")
-    supabase_key = env("SUPABASE_KEY")
-    return create_client(supabase_url, supabase_key)
-
-# === Functie: nieuw access token ophalen via refresh ===
-def refresh_access_token() -> str:
-    client_id = env("STRAVA_CLIENT_ID")
-    client_secret = env("STRAVA_CLIENT_SECRET")
-    refresh_token = env("STRAVA_REFRESH_TOKEN")
-
+# --------------------------------------------------
+# Strava OAuth refresh
+# --------------------------------------------------
+def refresh_strava_token():
+    print("DEBUG: Refreshing Strava access token...")
     response = requests.post(
-        "https://www.strava.com/oauth/token",
+        "https://www.strava.com/api/v3/oauth/token",
         data={
-            "client_id": client_id,
-            "client_secret": client_secret,
+            "client_id": STRAVA_CLIENT_ID,
+            "client_secret": STRAVA_CLIENT_SECRET,
             "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
+            "refresh_token": STRAVA_REFRESH_TOKEN,
         },
     )
+    response.raise_for_status()
+    token_data = response.json()
+    print("DEBUG: Nieuw access token verkregen")
+    return token_data["access_token"]
 
-    if response.status_code != 200:
-        raise RuntimeError(f"Strava token refresh failed: {response.text}")
-
-    tokens = response.json()
-    logging.debug("Nieuw access token verkregen")
-    return tokens["access_token"]
-
-# === Functie: activiteiten ophalen ===
-def fetch_recent_activities(access_token: str, days: int = 30):
-    after = int((datetime.datetime.now() - datetime.timedelta(days=days)).timestamp())
-    page = 1
-    activities = []
-
+# --------------------------------------------------
+# Activiteiten ophalen
+# --------------------------------------------------
+def fetch_recent_activities(access_token, days=30):
+    print("DEBUG: Fetching activities from last 30 days")
+    url = "https://www.strava.com/api/v3/athlete/activities"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    params = {"per_page": 200, "page": 1}
+    all_acts = []
     while True:
-        url = f"https://www.strava.com/api/v3/athlete/activities?after={after}&page={page}&per_page=200"
-        r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"})
-        if r.status_code != 200:
-            r.raise_for_status()
-
+        r = requests.get(url, headers=headers, params=params)
+        r.raise_for_status()
         page_data = r.json()
         if not page_data:
             break
+        all_acts.extend(page_data)
+        if len(page_data) < 200:
+            break
+        params["page"] += 1
+    print(f"DEBUG: Total {len(all_acts)} activities fetched")
+    return all_acts
 
-        logging.debug(f"Pagina {page} → {len(page_data)} activiteiten")
-        activities.extend(page_data)
-        page += 1
+# --------------------------------------------------
+# Upload naar Supabase (alleen calorieën > 0)
+# --------------------------------------------------
+def upload_to_supabase(activities):
+    print("DEBUG: Uploading calories to Supabase...")
 
-    logging.debug(f"Totaal {len(activities)} activiteiten opgehaald")
-    return activities
+    payload = []
+    skipped = 0
 
-# === Functie: upload naar Supabase ===
-def upload_to_supabase(data):
-    supabase = get_supabase()
-    try:
-        resp = supabase.table("strava_activities").upsert(data, on_conflict="id").execute()
-        logging.debug(f"{len(data)} activiteiten geüpload naar Supabase")
-        return resp
-    except Exception as e:
-        logging.error(f"Upload error: {e}")
-        raise
-
-# === Main ===
-def main():
-    logging.debug("Start sync - laatste 30 dagen")
-
-    token = refresh_access_token()
-    activities = fetch_recent_activities(token, days=30)
-
-    # Alleen relevante velden + calorieën
-    prepared = []
     for act in activities:
-        prepared.append({
-            "id": act.get("id"),
-            "name": act.get("name"),
-            "type": act.get("type"),
-            "start_date": act.get("start_date"),
-            "distance": act.get("distance"),
-            "moving_time": act.get("moving_time"),
-            "total_elevation_gain": act.get("total_elevation_gain"),
-            "average_speed": act.get("average_speed"),
-            "max_speed": act.get("max_speed"),
-            "average_heartrate": act.get("average_heartrate"),
-            "max_heartrate": act.get("max_heartrate"),
-            "calories": act.get("calories"),  # ✅ calorieën toegevoegd
-        })
+        calories = act.get("calories")
+        if calories and calories > 0:
+            payload.append({
+                "id": act.get("id"),
+                "name": act.get("name"),
+                "type": act.get("type"),
+                "start_date": act.get("start_date_local"),
+                "calories": calories
+            })
+        else:
+            skipped += 1
 
-    # Opslaan als backup (optioneel)
+    print(f"DEBUG: {skipped} activiteiten overgeslagen zonder calorieën")
+
+    if not payload:
+        print("⚠️ Geen activiteiten met calorieën gevonden — upload wordt overgeslagen.")
+        return
+
+    try:
+        response = SUPABASE.table(SUPABASE_TABLE).upsert(payload, on_conflict="id").execute()
+        print(f"✅ Uploaded {len(payload)} records to Supabase")
+    except Exception as e:
+        print(f"❌ ERROR: Upload to Supabase failed → {e}")
+
+# --------------------------------------------------
+# Main
+# --------------------------------------------------
+def main():
+    token = refresh_strava_token()
+    activities = fetch_recent_activities(token)
     with open("activiteiten_raw.json", "w") as f:
         json.dump(activities, f, indent=2)
-        logging.debug(f"Saved {len(activities)} activities to activiteiten_raw.json")
+    upload_to_supabase(activities)
+    print("DEBUG: Sync afgerond ✅")
 
-    # Upload naar Supabase
-    upload_to_supabase(prepared)
-    logging.debug("Sync afgerond ✅")
-
-# === Script uitvoeren ===
 if __name__ == "__main__":
     main()
