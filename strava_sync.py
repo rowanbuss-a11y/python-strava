@@ -36,7 +36,7 @@ def refresh_strava_token():
     return token_data["access_token"]
 
 # --------------------------------------------------
-# Activiteiten ophalen (laatste 'days' dagen)
+# Activiteiten ophalen
 # --------------------------------------------------
 def fetch_recent_activities(access_token, days=60):
     print(f"DEBUG: Fetching activities from last {days} days")
@@ -44,8 +44,9 @@ def fetch_recent_activities(access_token, days=60):
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {"per_page": 200, "page": 1}
     all_acts = []
+
     cutoff_ts = int((datetime.utcnow() - timedelta(days=days)).timestamp())
-    
+
     while True:
         r = requests.get(url, headers=headers, params=params)
         r.raise_for_status()
@@ -53,13 +54,13 @@ def fetch_recent_activities(access_token, days=60):
         if not page_data:
             break
 
-        # Filter alleen activiteiten binnen de laatste 'days' dagen
+        # Filter activiteiten op basis van dagen_back
         filtered = [
             a for a in page_data
-            if int(datetime.fromisoformat(a["start_date_local"].replace("Z", "+00:00")).timestamp()) >= cutoff_ts
+            if int(datetime.strptime(a["start_date_local"], "%Y-%m-%dT%H:%M:%SZ").timestamp()) >= cutoff_ts
         ]
-
         all_acts.extend(filtered)
+
         if len(page_data) < 200:
             break
         params["page"] += 1
@@ -68,18 +69,30 @@ def fetch_recent_activities(access_token, days=60):
     return all_acts
 
 # --------------------------------------------------
+# Optioneel: haal gear_name op via gear_id (beperkt API calls)
+# --------------------------------------------------
+def fetch_gear_name(access_token, gear_id):
+    if not gear_id:
+        return None
+    headers = {"Authorization": f"Bearer {access_token}"}
+    r = requests.get(f"https://www.strava.com/api/v3/gears/{gear_id}", headers=headers)
+    if r.status_code == 200:
+        return r.json().get("name")
+    return None
+
+# --------------------------------------------------
 # Upload naar Supabase
 # --------------------------------------------------
-def upload_to_supabase(activities):
+def upload_to_supabase(activities, access_token):
     print("DEBUG: Uploading activities to Supabase...")
 
     payload = []
-    skipped = 0
 
     for act in activities:
-        calories = act.get("calories")
-        if calories is None:
-            skipped += 1
+        # Fallbacks
+        calories = act.get("calories") or 0
+        gear_id = act.get("gear_id")
+        gear_name = act.get("gear_name") or fetch_gear_name(access_token, gear_id)
 
         payload.append({
             "id": act.get("id"),
@@ -87,8 +100,8 @@ def upload_to_supabase(activities):
             "type": act.get("type"),
             "start_date": act.get("start_date_local"),
             "calories": calories,
-            "gear_id": act.get("gear_id"),
-            "gear_name": act.get("gear_name"),
+            "gear_id": gear_id,
+            "gear_name": gear_name,
             "distance": act.get("distance"),
             "moving_time": act.get("moving_time"),
             "elapsed_time": act.get("elapsed_time"),
@@ -103,8 +116,6 @@ def upload_to_supabase(activities):
             "private": act.get("private"),
             "description": act.get("description"),
         })
-
-    print(f"DEBUG: {skipped} activiteiten zonder calorieën")
 
     if not payload:
         print("⚠️ Geen activiteiten om te uploaden")
@@ -127,7 +138,7 @@ def main():
     with open("activiteiten_raw.json", "w") as f:
         json.dump(activities, f, indent=2)
 
-    upload_to_supabase(activities)
+    upload_to_supabase(activities, token)
     print("DEBUG: Sync afgerond ✅")
 
 if __name__ == "__main__":
