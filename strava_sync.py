@@ -84,7 +84,6 @@ def upload_to_supabase(activities: list[dict]) -> None:
             "start_date": act.get("start_date"),
             "distance": act.get("distance"),
             "moving_time": int(act.get("moving_time", 0)),  # in seconden
-            "elapsed_time": int(act.get("elapsed_time", 0)),  # in seconden
             "total_elevation_gain": act.get("total_elevation_gain"),
             "average_speed": act.get("average_speed"),
             "max_speed": act.get("max_speed"),
