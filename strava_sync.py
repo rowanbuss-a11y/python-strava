@@ -37,11 +37,16 @@ def refresh_strava_token():
 # --------------------------------------------------
 # Activiteiten ophalen
 # --------------------------------------------------
-def fetch_recent_activities(access_token, days=30):
+def fetch_recent_activities(access_token, days=60):
     print(f"DEBUG: Fetching activities from last {days} days")
     url = "https://www.strava.com/api/v3/athlete/activities"
     headers = {"Authorization": f"Bearer {access_token}"}
-    params = {"per_page": 200, "page": 1}
+    
+    # timestamp van dagen geleden
+    import time
+    after_timestamp = int(time.time()) - days * 24 * 60 * 60
+
+    params = {"per_page": 200, "page": 1, "after": after_timestamp}
     all_acts = []
     while True:
         r = requests.get(url, headers=headers, params=params)
@@ -57,17 +62,17 @@ def fetch_recent_activities(access_token, days=30):
     return all_acts
 
 # --------------------------------------------------
-# Upload naar Supabase (alleen calorieën > 0)
+# Upload naar Supabase (alleen calorieën en basisvelden)
 # --------------------------------------------------
 def upload_to_supabase(activities):
-    print("DEBUG: Uploading calories to Supabase...")
+    print("DEBUG: Uploading activities to Supabase...")
 
     payload = []
     skipped = 0
 
     for act in activities:
         calories = act.get("calories")
-        if calories and calories > 0:
+        if calories is not None:
             payload.append({
                 "id": act.get("id"),
                 "name": act.get("name"),
@@ -95,12 +100,10 @@ def upload_to_supabase(activities):
 # --------------------------------------------------
 def main():
     token = refresh_strava_token()
-    activities = fetch_recent_activities(token)
-    
-    # Opslaan van raw JSON voor debugging
+    activities = fetch_recent_activities(token, days=60)
+    # Raw JSON opslaan voor debug / backup
     with open("activiteiten_raw.json", "w") as f:
         json.dump(activities, f, indent=2)
-    
     upload_to_supabase(activities)
     print("DEBUG: Sync afgerond ✅")
 
