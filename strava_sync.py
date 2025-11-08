@@ -1,488 +1,172 @@
-"""
-Strava sync script - laatste 30 dagen alleen
-Vereenvoudigde versie die alleen recente activiteiten ophaalt
-"""
 import os
-import csv
-import json
-import time
-from datetime import datetime, timedelta
-
 import requests
-import psycopg2
-from psycopg2.extras import execute_values
+import datetime
+import json
+
+# ==============
+# CONFIG
+# ==============
+
+STRAVA_API_URL = "https://www.strava.com/api/v3"
 
 
-def env(name: str, required: bool = True, default: str | None = None) -> str | None:
-    value = os.environ.get(name, default)
-    if required and (value is None or value == ""):
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
+# ==========================
+# TOKEN MANAGEMENT
+# ==========================
 
+def refresh_access_token():
+    """Vernieuw het Strava access token met de refresh token"""
+    client_id = os.environ.get("STRAVA_CLIENT_ID")
+    client_secret = os.environ.get("STRAVA_CLIENT_SECRET")
+    refresh_token = os.environ.get("STRAVA_REFRESH_TOKEN")
 
-def exchange_authorization_code(client_id: str, client_secret: str, auth_code: str) -> dict:
-    url = "https://www.strava.com/oauth/token"
-    payload = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "code": auth_code,
-        "grant_type": "authorization_code",
-    }
-    redirect_uri = os.environ.get("STRAVA_REDIRECT_URI")
-    if redirect_uri:
-        payload["redirect_uri"] = redirect_uri
+    if not all([client_id, client_secret, refresh_token]):
+        raise ValueError("Strava clientgegevens ontbreken in environment variables")
 
-    response = requests.post(url, data=payload, timeout=30)
-    if response.status_code == 400:
-        error_text = response.text[:300]
-        raise RuntimeError(
-            f"Auth code invalid/expired. Generate fresh: "
-            f"https://www.strava.com/oauth/authorize?client_id={client_id}&response_type=code&redirect_uri={redirect_uri or 'YOUR_REDIRECT_URI'}&approval_prompt=force&scope=read,activity:read_all"
-        )
-    response.raise_for_status()
-    return response.json()
-
-
-class TokenStore:
-    """Token store voor Supabase/Postgres"""
-    def __init__(self, dsn: str):
-        self.dsn = dsn
-        try:
-            self._ensure_table()
-        except Exception:
-            raise
-
-    @staticmethod
-    def from_env():
-        if os.environ.get("DISABLE_DB_TOKEN_STORE") in ("1", "true", "True"):
-            return None
-        host = os.environ.get("DB_HOST")
-        user = os.environ.get("DB_USER")
-        password = os.environ.get("DB_PASSWORD")
-        name = os.environ.get("DB_NAME", "postgres")
-        port = os.environ.get("DB_PORT", "5432")
-        if not (host and user and password):
-            return None
-        dsn = f"host={host} user={user} password={password} dbname={name} port={port}"
-        try:
-            return TokenStore(dsn)
-        except Exception:
-            return None
-
-    def _ensure_table(self) -> None:
-        with psycopg2.connect(self.dsn) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS oauth_tokens (
-                        provider TEXT PRIMARY KEY,
-                        access_token TEXT,
-                        refresh_token TEXT NOT NULL,
-                        expires_at BIGINT
-                    )
-                """)
-                conn.commit()
-
-    def load_refresh_token(self) -> str | None:
-        with psycopg2.connect(self.dsn) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT refresh_token FROM oauth_tokens WHERE provider = %s",
-                    ("strava",),
-                )
-                row = cur.fetchone()
-                if row and row[0]:
-                    return row[0]
-        return None
-
-    def save_tokens(
-        self,
-        *,
-        access_token: str | None,
-        refresh_token: str,
-        expires_at: int | None,
-    ) -> None:
-        with psycopg2.connect(self.dsn) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO oauth_tokens (provider, access_token, refresh_token, expires_at)
-                    VALUES ('strava', %s, %s, %s)
-                    ON CONFLICT (provider) DO UPDATE SET
-                        access_token = EXCLUDED.access_token,
-                        refresh_token = EXCLUDED.refresh_token,
-                        expires_at = EXCLUDED.expires_at
-                """, (access_token, refresh_token, expires_at))
-                conn.commit()
-
-
-def get_access_token() -> str:
-    direct = os.environ.get("STRAVA_ACCESS_TOKEN")
-    if direct:
-        return direct
-
-    client_id = env("STRAVA_CLIENT_ID")
-    client_secret = env("STRAVA_CLIENT_SECRET")
-
-    # Try DB store first, then env
-    store = TokenStore.from_env()
-    refresh_token = None
-    if store:
-        try:
-            refresh_token = store.load_refresh_token()
-        except Exception:
-            refresh_token = None
-    if not refresh_token:
-        refresh_token = os.environ.get("STRAVA_REFRESH_TOKEN")
-
-    # Try refresh token first
-    if refresh_token:
-        url = "https://www.strava.com/oauth/token"
-        payload = {
+    response = requests.post(
+        "https://www.strava.com/api/v3/oauth/token",
+        data={
             "client_id": client_id,
             "client_secret": client_secret,
-            "refresh_token": refresh_token,
             "grant_type": "refresh_token",
-        }
-        response = requests.post(url, data=payload, timeout=30)
-        if response.status_code == 200:
-            data = response.json()
-            new_refresh = data.get("refresh_token")
-            expires_in = data.get("expires_in")
-            if new_refresh:
-                if store:
-                    expires_at = int(datetime.now().timestamp()) + int(expires_in or 0)
-                    store.save_tokens(
-                        access_token=data.get("access_token"),
-                        refresh_token=new_refresh,
-                        expires_at=expires_at,
-                    )
-                    print("DEBUG: New refresh token saved to database")
-                else:
-                    print("DEBUG: New refresh token - update STRAVA_REFRESH_TOKEN Secret")
-                    with open("new_refresh_token.txt", "w") as f:
-                        f.write(new_refresh)
-            return data["access_token"]
-
-    # Fallback to auth code
-    auth_code = os.environ.get("STRAVA_AUTH_CODE")
-    if auth_code:
-        print("DEBUG: Using authorization code for bootstrap...")
-        data = exchange_authorization_code(client_id, client_secret, auth_code)
-        new_refresh = data.get("refresh_token")
-        expires_in = data.get("expires_in")
-        if new_refresh:
-            if store:
-                expires_at = int(datetime.now().timestamp()) + int(expires_in or 0)
-                store.save_tokens(
-                    access_token=data.get("access_token"),
-                    refresh_token=new_refresh,
-                    expires_at=expires_at,
-                )
-                print("DEBUG: New refresh token saved to database")
-            else:
-                print("DEBUG: New refresh token - update STRAVA_REFRESH_TOKEN Secret")
-                with open("new_refresh_token.txt", "w") as f:
-                    f.write(new_refresh)
-        return data["access_token"]
-
-    raise RuntimeError(
-        "No valid refresh token or auth code. Set STRAVA_REFRESH_TOKEN or STRAVA_AUTH_CODE"
+            "refresh_token": refresh_token,
+        },
     )
 
+    if response.status_code != 200:
+        raise RuntimeError(f"Kon access token niet vernieuwen: {response.text}")
 
-def fetch_recent_activities(access_token: str, days: int = 30) -> list[dict]:
-    """Haal activiteiten op van de laatste N dagen"""
-    activities = []
-    page = 1
-    per_page = 200
-    after_date = datetime.now() - timedelta(days=days)
+    token_data = response.json()
+    print("DEBUG: New refresh token - update STRAVA_REFRESH_TOKEN Secret")
+    return token_data["access_token"]
+
+
+# ==========================
+# FETCH ACTIVITIES
+# ==========================
+
+def fetch_recent_activities(access_token, days=30):
+    """Haal activiteiten van de afgelopen X dagen op"""
+    after_date = datetime.datetime.utcnow() - datetime.timedelta(days=days)
     after_timestamp = int(after_date.timestamp())
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    page = 1
+    all_activities = []
 
     print(f"DEBUG: Fetching activities from last {days} days (after {after_date.date()})")
 
     while True:
-        url = "https://www.strava.com/api/v3/athlete/activities"
-        headers = {"Authorization": f"Bearer {access_token}"}
-        params = {
-            "page": page,
-            "per_page": per_page,
-            "after": after_timestamp,
-        }
+        params = {"after": after_timestamp, "page": page, "per_page": 100}
+        r = requests.get(f"{STRAVA_API_URL}/athlete/activities", headers=headers, params=params)
 
-        response = requests.get(url, headers=headers, params=params, timeout=60)
-
-        if response.status_code == 429:
-            print("DEBUG: Rate limit - waiting 60s...")
-            time.sleep(60)
-            continue
-
-        if response.status_code == 401:
+        if r.status_code == 401:
             raise RuntimeError("401 Unauthorized - token may be invalid")
 
-        response.raise_for_status()
-        page_activities = response.json()
-
-        if not page_activities:
+        activities = r.json()
+        if not activities:
             break
 
-        activities.extend(page_activities)
-        print(f"DEBUG: Page {page}: {len(page_activities)} activities")
-
-        # Stop if we got fewer than per_page (last page)
-        if len(page_activities) < per_page:
-            break
-
+        print(f"DEBUG: Page {page}: {len(activities)} activities")
+        all_activities.extend(activities)
         page += 1
 
-    print(f"DEBUG: Total: {len(activities)} activities")
-    return activities
+    print(f"DEBUG: Total: {len(all_activities)} activities")
+    return all_activities
 
 
-def save_to_csv(activities: list[dict], filename: str) -> None:
-    """Sla activiteiten op in CSV"""
-    if not activities:
-        print("DEBUG: No activities to save")
+# ==========================
+# SAVE TO SUPABASE
+# ==========================
+
+def save_to_supabase(activities):
+    """Sla Strava-data op in Supabase via de REST API"""
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+    table = os.environ.get("SUPABASE_TABLE", "strava_activities")
+
+    if not url or not key:
+        print("DEBUG: Supabase API niet geconfigureerd, skip upload")
         return
 
-    fieldnames = [
-        "ID", "Naam", "Datum", "Type", "Afstand (km)", "Tijd (min)",
-        "Totale tijd (min)", "Hoogtemeters", "Gemiddelde snelheid (km/u)",
-        "Max snelheid (km/u)", "Gemiddelde hartslag", "Max hartslag",
-    ]
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates"
+    }
 
-    file_exists = os.path.exists(filename)
-    existing_ids = set()
+    endpoint = f"{url}/rest/v1/{table}"
 
-    if file_exists:
-        with open(filename, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if "ID" in row:
-                    existing_ids.add(row["ID"])
-
-    new_rows = []
+    rows = []
     for act in activities:
-        act_id = str(act.get("id", ""))
-        if act_id in existing_ids:
-            continue
-
-        new_rows.append({
-            "ID": act_id,
-            "Naam": act.get("name", ""),
-            "Datum": act.get("start_date", ""),
-            "Type": act.get("type", ""),
-            "Afstand (km)": round(act.get("distance", 0) / 1000, 2),
-            "Tijd (min)": round(act.get("moving_time", 0) / 60, 2),
-            "Totale tijd (min)": round(act.get("elapsed_time", 0) / 60, 2),
-            "Hoogtemeters": act.get("total_elevation_gain", 0),
-            "Gemiddelde snelheid (km/u)": round(act.get("average_speed", 0) * 3.6, 2),
-            "Max snelheid (km/u)": round(act.get("max_speed", 0) * 3.6, 2),
-            "Gemiddelde hartslag": act.get("average_heartrate"),
-            "Max hartslag": act.get("max_heartrate"),
+        start_latlng = act.get("start_latlng", [])
+        end_latlng = act.get("end_latlng", [])
+        rows.append({
+            "id": act.get("id"),
+            "name": act.get("name"),
+            "type": act.get("type"),
+            "start_date": act.get("start_date"),
+            "distance": act.get("distance"),
+            "moving_time": act.get("moving_time"),
+            "elapsed_time": act.get("elapsed_time"),
+            "total_elevation_gain": act.get("total_elevation_gain"),
+            "average_speed": act.get("average_speed"),
+            "max_speed": act.get("max_speed"),
+            "average_heartrate": act.get("average_heartrate"),
+            "max_heartrate": act.get("max_heartrate"),
+            "start_latitude": start_latlng[0] if start_latlng else None,
+            "start_longitude": start_latlng[1] if len(start_latlng) > 1 else None,
+            "end_latitude": end_latlng[0] if end_latlng else None,
+            "end_longitude": end_latlng[1] if len(end_latlng) > 1 else None,
+            "timezone": act.get("timezone"),
+            "utc_offset": act.get("utc_offset"),
+            "kudos_count": act.get("kudos_count", 0),
+            "comment_count": act.get("comment_count", 0),
+            "gear_id": act.get("gear_id"),
+            "trainer": act.get("trainer", False),
+            "commute": act.get("commute", False),
+            "private": act.get("private", False),
+            "description": act.get("description"),
         })
 
-    if not new_rows:
-        print("DEBUG: No new activities to add")
-        return
-
-    mode = "a" if file_exists else "w"
-    with open(filename, mode, newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerows(new_rows)
-
-    print(f"DEBUG: Saved {len(new_rows)} new activities to {filename}")
+    r = requests.post(endpoint, headers=headers, json=rows, timeout=60)
+    if r.status_code not in (200, 201, 204):
+        print(f"DEBUG: Supabase insert failed ({r.status_code}): {r.text[:500]}")
+    else:
+        print(f"DEBUG: Saved {len(rows)} activities to Supabase")
 
 
-def save_to_json(activities: list[dict], filename: str) -> None:
-    """Sla activiteiten op in JSON"""
-    if not activities:
-        return
+# ==========================
+# SAVE LOCAL FILES
+# ==========================
 
-    existing = []
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r", encoding="utf-8") as f:
-                existing = json.load(f)
-        except Exception:
-            existing = []
+def save_local(activities):
+    with open("activiteiten_raw.json", "w") as f:
+        json.dump(activities, f, indent=2)
+    print(f"DEBUG: Saved {len(activities)} activities to activiteiten_raw.json")
 
-    existing.extend(activities)
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(existing, f)
-
-    print(f"DEBUG: Saved {len(activities)} activities to {filename}")
+    import csv
+    with open("activiteiten.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "name", "type", "distance", "start_date"])
+        for a in activities:
+            writer.writerow([a.get("id"), a.get("name"), a.get("type"), a.get("distance"), a.get("start_date")])
+    print(f"DEBUG: Saved {len(activities)} new activities to activiteiten.csv")
 
 
-def init_database() -> dict | None:
-    """Initialiseer database connectie en tabellen"""
-    host = os.environ.get("DB_HOST")
-    user = os.environ.get("DB_USER")
-    password = os.environ.get("DB_PASSWORD")
-    name = os.environ.get("DB_NAME", "postgres")
-    port = os.environ.get("DB_PORT", "5432")
-    
-    if not (host and user and password):
-        return None
-    
-    try:
-        db_config = {
-            "host": host,
-            "user": user,
-            "password": password,
-            "dbname": name,
-            "port": port,
-        }
-        
-        with psycopg2.connect(**db_config) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS strava_activities (
-                        id BIGINT PRIMARY KEY,
-                        name VARCHAR(255),
-                        type VARCHAR(50),
-                        start_date TIMESTAMP,
-                        distance FLOAT,
-                        moving_time INTEGER,
-                        elapsed_time INTEGER,
-                        total_elevation_gain FLOAT,
-                        average_speed FLOAT,
-                        max_speed FLOAT,
-                        average_heartrate FLOAT,
-                        max_heartrate FLOAT,
-                        start_latitude FLOAT,
-                        start_longitude FLOAT,
-                        end_latitude FLOAT,
-                        end_longitude FLOAT,
-                        timezone VARCHAR(100),
-                        utc_offset INTEGER,
-                        kudos_count INTEGER,
-                        comment_count INTEGER,
-                        gear_id VARCHAR(100),
-                        trainer BOOLEAN,
-                        commute BOOLEAN,
-                        private BOOLEAN,
-                        description TEXT
-                    )
-                """)
-                conn.commit()
-        
-        print("DEBUG: Database initialized")
-        return db_config
-    except Exception as e:
-        print(f"DEBUG: Database init failed: {e}")
-        return None
+# ==========================
+# MAIN
+# ==========================
 
-
-def save_to_database(activities: list[dict], db_config: dict) -> None:
-    """Sla activiteiten op in Supabase"""
-    if not activities or not db_config:
-        return
-    
-    try:
-        with psycopg2.connect(**db_config) as conn:
-            with conn.cursor() as cur:
-                activity_data = []
-                for act in activities:
-                    start_latlng = act.get("start_latlng", [])
-                    end_latlng = act.get("end_latlng", [])
-                    
-                    activity_data.append((
-                        act.get("id"),
-                        act.get("name"),
-                        act.get("type"),
-                        act.get("start_date"),
-                        act.get("distance"),
-                        act.get("moving_time"),
-                        act.get("elapsed_time"),
-                        act.get("total_elevation_gain"),
-                        act.get("average_speed"),
-                        act.get("max_speed"),
-                        act.get("average_heartrate"),
-                        act.get("max_heartrate"),
-                        start_latlng[0] if start_latlng and len(start_latlng) > 0 else None,
-                        start_latlng[1] if start_latlng and len(start_latlng) > 1 else None,
-                        end_latlng[0] if end_latlng and len(end_latlng) > 0 else None,
-                        end_latlng[1] if end_latlng and len(end_latlng) > 1 else None,
-                        act.get("timezone"),
-                        act.get("utc_offset"),
-                        act.get("kudos_count", 0),
-                        act.get("comment_count", 0),
-                        act.get("gear_id"),
-                        act.get("trainer", False),
-                        act.get("commute", False),
-                        act.get("private", False),
-                        act.get("description"),
-                    ))
-                
-                execute_values(cur, """
-                    INSERT INTO strava_activities 
-                    (id, name, type, start_date, distance, moving_time, elapsed_time, 
-                     total_elevation_gain, average_speed, max_speed, average_heartrate, 
-                     max_heartrate, start_latitude, start_longitude, end_latitude, 
-                     end_longitude, timezone, utc_offset, kudos_count, comment_count, 
-                     gear_id, trainer, commute, private, description)
-                    VALUES %s
-                    ON CONFLICT (id) DO UPDATE SET
-                        name = EXCLUDED.name,
-                        type = EXCLUDED.type,
-                        start_date = EXCLUDED.start_date,
-                        distance = EXCLUDED.distance,
-                        moving_time = EXCLUDED.moving_time,
-                        elapsed_time = EXCLUDED.elapsed_time,
-                        total_elevation_gain = EXCLUDED.total_elevation_gain,
-                        average_speed = EXCLUDED.average_speed,
-                        max_speed = EXCLUDED.max_speed,
-                        average_heartrate = EXCLUDED.average_heartrate,
-                        max_heartrate = EXCLUDED.max_heartrate,
-                        start_latitude = EXCLUDED.start_latitude,
-                        start_longitude = EXCLUDED.start_longitude,
-                        end_latitude = EXCLUDED.end_latitude,
-                        end_longitude = EXCLUDED.end_longitude,
-                        timezone = EXCLUDED.timezone,
-                        utc_offset = EXCLUDED.utc_offset,
-                        kudos_count = EXCLUDED.kudos_count,
-                        comment_count = EXCLUDED.comment_count,
-                        gear_id = EXCLUDED.gear_id,
-                        trainer = EXCLUDED.trainer,
-                        commute = EXCLUDED.commute,
-                        private = EXCLUDED.private,
-                        description = EXCLUDED.description
-                """, activity_data)
-                
-                conn.commit()
-        
-        print(f"DEBUG: Saved {len(activities)} activities to database")
-    except Exception as e:
-        print(f"DEBUG: Database save failed: {e}")
-
-
-def main() -> None:
-    csv_file = os.environ.get("CSV_FILE", "activiteiten.csv")
-    json_file = os.environ.get("JSON_FILE", "activiteiten_raw.json")
-    days = int(os.environ.get("DAYS_BACK", "30"))
-
-    print(f"DEBUG: Start sync - laatste {days} dagen")
-
-    # Initialize database if available
-    db_config = init_database()
-
-    token = get_access_token()
-    activities = fetch_recent_activities(token, days=days)
-
-    if not activities:
-        print("DEBUG: Geen nieuwe activiteiten gevonden")
-        return
-
-    save_to_csv(activities, csv_file)
-    save_to_json(activities, json_file)
-    
-    if db_config:
-        save_to_database(activities, db_config)
-    
+def main():
+    print("DEBUG: Start sync - laatste 30 dagen")
+    access_token = refresh_access_token()
+    activities = fetch_recent_activities(access_token)
+    save_local(activities)
+    save_to_supabase(activities)
     print("DEBUG: Sync gereed")
 
 
 if __name__ == "__main__":
     main()
-
