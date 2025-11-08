@@ -59,31 +59,44 @@ def fetch_recent_activities(access_token, days=60):
     return all_acts
 
 # --------------------------------------------------
-# Upload naar Supabase (alleen calorieën)
+# Upload naar Supabase (alle velden)
 # --------------------------------------------------
 def upload_to_supabase(activities):
-    print("DEBUG: Uploading calories to Supabase...")
+    print("DEBUG: Uploading activities to Supabase...")
 
     payload = []
-    skipped = 0
-
     for act in activities:
-        calories = act.get("calories")
-        if calories and calories > 0:
-            payload.append({
-                "id": act.get("id"),
-                "name": act.get("name"),
-                "type": act.get("type"),
-                "start_date": act.get("start_date_local"),
-                "calories": calories
-            })
-        else:
-            skipped += 1
-
-    print(f"DEBUG: {skipped} activiteiten overgeslagen zonder calorieën")
+        payload.append({
+            "id": act.get("id"),
+            "name": act.get("name"),
+            "type": act.get("type"),
+            "start_date": act.get("start_date_local"),
+            "distance": act.get("distance"),
+            "moving_time": act.get("moving_time"),
+            "total_elevation_gain": act.get("total_elevation_gain"),
+            "average_speed": act.get("average_speed"),
+            "max_speed": act.get("max_speed"),
+            "calories": act.get("calories"),
+            "average_heartrate": act.get("average_heartrate"),
+            "max_heartrate": act.get("max_heartrate"),
+            "has_heartrate": act.get("has_heartrate"),
+            "kudos_count": act.get("kudos_count"),
+            "comment_count": act.get("comment_count"),
+            "athlete_count": act.get("athlete_count"),
+            "photo_count": act.get("photo_count"),
+            "trainer": act.get("trainer"),
+            "commute": act.get("commute"),
+            "private": act.get("private"),
+            "flagged": act.get("flagged"),
+            "gear_id": act.get("gear_id"),
+            "device_name": act.get("device_name"),
+            "description": act.get("description"),
+            "map_id": act.get("map", {}).get("id"),
+            "gps_data": json.dumps(act.get("map", {}))  # of andere GPS-data
+        })
 
     if not payload:
-        print("⚠️ Geen activiteiten met calorieën gevonden — upload wordt overgeslagen.")
+        print("⚠️ Geen activiteiten gevonden voor upload.")
         return
 
     try:
@@ -93,7 +106,7 @@ def upload_to_supabase(activities):
         print(f"❌ ERROR: Upload to Supabase failed → {e}")
 
 # --------------------------------------------------
-# Full refresh (verwijder oude activiteiten in periode en upload opnieuw)
+# Full refresh
 # --------------------------------------------------
 def full_refresh_supabase(activities):
     if not activities:
