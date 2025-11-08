@@ -1,4 +1,5 @@
 requests
 polyline
 psycopg2-binary
+supabase
 
