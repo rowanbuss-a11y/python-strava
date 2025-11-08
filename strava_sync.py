@@ -36,7 +36,7 @@ def refresh_strava_token():
     return token_data["access_token"]
 
 # --------------------------------------------------
-# Activiteiten ophalen
+# Activiteiten ophalen (laatste 'days' dagen)
 # --------------------------------------------------
 def fetch_recent_activities(access_token, days=60):
     print(f"DEBUG: Fetching activities from last {days} days")
@@ -52,16 +52,18 @@ def fetch_recent_activities(access_token, days=60):
         page_data = r.json()
         if not page_data:
             break
-        # Filter alleen activiteiten in de laatste 'days' dagen
+
+        # Filter alleen activiteiten binnen de laatste 'days' dagen
         filtered = [
             a for a in page_data
-            if int(datetime.strptime(a["start_date_local"], "%Y-%m-%dT%H:%M:%S").timestamp()) >= cutoff_ts
+            if int(datetime.fromisoformat(a["start_date_local"].replace("Z", "+00:00")).timestamp()) >= cutoff_ts
         ]
+
         all_acts.extend(filtered)
         if len(page_data) < 200:
             break
         params["page"] += 1
-    
+
     print(f"DEBUG: Total {len(all_acts)} activities fetched")
     return all_acts
 
@@ -70,34 +72,42 @@ def fetch_recent_activities(access_token, days=60):
 # --------------------------------------------------
 def upload_to_supabase(activities):
     print("DEBUG: Uploading activities to Supabase...")
-    
+
     payload = []
+    skipped = 0
+
     for act in activities:
+        calories = act.get("calories")
+        if calories is None:
+            skipped += 1
+
         payload.append({
             "id": act.get("id"),
             "name": act.get("name"),
             "type": act.get("type"),
             "start_date": act.get("start_date_local"),
+            "calories": calories,
+            "gear_id": act.get("gear_id"),
+            "gear_name": act.get("gear_name"),
             "distance": act.get("distance"),
             "moving_time": act.get("moving_time"),
+            "elapsed_time": act.get("elapsed_time"),
             "total_elevation_gain": act.get("total_elevation_gain"),
             "average_speed": act.get("average_speed"),
             "max_speed": act.get("max_speed"),
-            "average_watts": act.get("average_watts"),
-            "weighted_average_watts": act.get("weighted_average_watts"),
-            "kilojoules": act.get("kilojoules"),
-            "calories": act.get("calories"),
-            "gear_id": act.get("gear_id"),
-            "gear_name": act.get("gear_name"),
+            "average_heartrate": act.get("average_heartrate"),
+            "max_heartrate": act.get("max_heartrate"),
+            "has_heartrate": act.get("has_heartrate"),
             "trainer": act.get("trainer"),
             "commute": act.get("commute"),
             "private": act.get("private"),
-            "perceived_exertion": act.get("perceived_exertion"),
-            "workout_type": act.get("workout_type")
+            "description": act.get("description"),
         })
-    
+
+    print(f"DEBUG: {skipped} activiteiten zonder calorieën")
+
     if not payload:
-        print("⚠️ Geen activiteiten gevonden om te uploaden — upload wordt overgeslagen.")
+        print("⚠️ Geen activiteiten om te uploaden")
         return
 
     try:
@@ -112,11 +122,11 @@ def upload_to_supabase(activities):
 def main():
     token = refresh_strava_token()
     activities = fetch_recent_activities(token, days=60)
-    
+
     # Opslaan van raw JSON voor debugging
     with open("activiteiten_raw.json", "w") as f:
         json.dump(activities, f, indent=2)
-    
+
     upload_to_supabase(activities)
     print("DEBUG: Sync afgerond ✅")
 
