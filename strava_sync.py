@@ -41,13 +41,9 @@ def fetch_recent_activities(access_token, days=60):
     print(f"DEBUG: Fetching activities from last {days} days")
     url = "https://www.strava.com/api/v3/athlete/activities"
     headers = {"Authorization": f"Bearer {access_token}"}
-    
-    # timestamp van dagen geleden
-    import time
-    after_timestamp = int(time.time()) - days * 24 * 60 * 60
-
-    params = {"per_page": 200, "page": 1, "after": after_timestamp}
+    params = {"per_page": 200, "page": 1}
     all_acts = []
+
     while True:
         r = requests.get(url, headers=headers, params=params)
         r.raise_for_status()
@@ -58,21 +54,22 @@ def fetch_recent_activities(access_token, days=60):
         if len(page_data) < 200:
             break
         params["page"] += 1
+
     print(f"DEBUG: Total {len(all_acts)} activities fetched")
     return all_acts
 
 # --------------------------------------------------
-# Upload naar Supabase (alleen calorieën en basisvelden)
+# Upload naar Supabase (alleen calorieën)
 # --------------------------------------------------
 def upload_to_supabase(activities):
-    print("DEBUG: Uploading activities to Supabase...")
+    print("DEBUG: Uploading calories to Supabase...")
 
     payload = []
     skipped = 0
 
     for act in activities:
         calories = act.get("calories")
-        if calories is not None:
+        if calories and calories > 0:
             payload.append({
                 "id": act.get("id"),
                 "name": act.get("name"),
@@ -96,15 +93,37 @@ def upload_to_supabase(activities):
         print(f"❌ ERROR: Upload to Supabase failed → {e}")
 
 # --------------------------------------------------
+# Full refresh (verwijder oude activiteiten in periode en upload opnieuw)
+# --------------------------------------------------
+def full_refresh_supabase(activities):
+    if not activities:
+        print("⚠️ Geen activiteiten gevonden voor full refresh.")
+        return
+
+    min_date = min(act["start_date_local"] for act in activities)
+    max_date = max(act["start_date_local"] for act in activities)
+
+    try:
+        SUPABASE.table(SUPABASE_TABLE).delete().gte("start_date", min_date).lte("start_date", max_date).execute()
+        print(f"DEBUG: Bestaande activiteiten van {min_date} t/m {max_date} verwijderd.")
+    except Exception as e:
+        print(f"❌ ERROR bij verwijderen bestaande records → {e}")
+
+    upload_to_supabase(activities)
+
+# --------------------------------------------------
 # Main
 # --------------------------------------------------
 def main():
     token = refresh_strava_token()
     activities = fetch_recent_activities(token, days=60)
-    # Raw JSON opslaan voor debug / backup
+
+    # Opslaan van raw JSON voor debugging
     with open("activiteiten_raw.json", "w") as f:
         json.dump(activities, f, indent=2)
-    upload_to_supabase(activities)
+
+    # Full refresh naar Supabase
+    full_refresh_supabase(activities)
     print("DEBUG: Sync afgerond ✅")
 
 if __name__ == "__main__":
