@@ -12,7 +12,7 @@ REFRESH_TOKEN = os.environ["STRAVA_REFRESH_TOKEN"]
 ACCESS_TOKEN_FILE = "access_token.json"
 CSV_FILE = os.environ.get("CSV_FILE", "activiteiten.csv")
 JSON_FILE = os.environ.get("JSON_FILE", "activiteiten_raw.json")
-DAYS_BACK = int(os.environ.get("DAYS_BACK", 30))
+DAYS_BACK = 60  # Historie van 60 dagen
 
 # Cache voor gear requests
 gear_cache = {}
@@ -66,7 +66,7 @@ def get_gear_name(access_token, gear_id):
             gear_cache[gear_id] = gear_name
             return gear_name
         elif r.status_code == 429:  # rate limit
-            print("Rate limit gear reached, wacht 30 sec...")
+            print("Rate limit gear bereikt, wacht 30 sec...")
             time.sleep(30)
         else:
             print(f"Fout bij ophalen gear {gear_id}: {r.status_code}")
@@ -106,7 +106,7 @@ def get_activities(access_token, after_timestamp):
         headers = {"Authorization": f"Bearer {access_token}"}
         r = requests.get(url, headers=headers)
         if r.status_code == 429:
-            print("Rate limit bereikt, wachten 30 sec...")
+            print("Rate limit activiteiten bereikt, wachten 30 sec...")
             time.sleep(30)
             continue
         r.raise_for_status()
@@ -117,32 +117,62 @@ def get_activities(access_token, after_timestamp):
         page += 1
     return activities
 
+def load_existing_ids():
+    existing_ids = set()
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                existing_ids.add(int(row["ID"]))
+    return existing_ids
+
 def main():
     access_token = get_valid_access_token()
     after_date = datetime.now() - timedelta(days=DAYS_BACK)
     after_timestamp = int(after_date.timestamp())
 
-    print(f"Ophalen activiteiten vanaf {after_date}")
+    existing_ids = load_existing_ids()
+    print(f"Bestaande activiteiten: {len(existing_ids)}")
+
     activities = get_activities(access_token, after_timestamp)
+    print(f"Opgehaalde activiteiten: {len(activities)}")
 
-    all_rows = []
+    new_rows = []
     for act in activities:
+        if act["id"] in existing_ids:
+            continue
         row = prepare_activity_row(act, access_token)
-        all_rows.append(row)
+        new_rows.append(row)
 
-    # Opslaan JSON
+    if not new_rows:
+        print("Geen nieuwe activiteiten gevonden.")
+        return
+
+    # JSON opslaan
+    all_json = []
+    if os.path.exists(JSON_FILE):
+        with open(JSON_FILE) as f:
+            all_json = json.load(f)
+    all_json.extend(new_rows)
     with open(JSON_FILE, "w") as f:
-        json.dump(all_rows, f, indent=2)
+        json.dump(all_json, f, indent=2)
 
-    # Opslaan CSV
-    if all_rows:
-        keys = all_rows[0].keys()
-        with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
-            dict_writer = csv.DictWriter(f, keys)
-            dict_writer.writeheader()
-            dict_writer.writerows(all_rows)
+    # CSV opslaan
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            all_rows = list(reader)
+    else:
+        all_rows = []
 
-    print(f"Succesvol {len(all_rows)} activiteiten opgeslagen in {CSV_FILE} en {JSON_FILE}.")
+    all_rows.extend(new_rows)
+    keys = all_rows[0].keys()
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    print(f"Succesvol {len(new_rows)} nieuwe activiteiten toegevoegd aan CSV en JSON.")
 
 if __name__ == "__main__":
     main()
