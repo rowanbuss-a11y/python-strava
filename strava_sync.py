@@ -20,7 +20,6 @@ DAYS_BACK = int(os.getenv("DAYS_BACK", 60))
 SUPABASE_TABLE = "strava_activities"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
 # === Functies ===
 
 def refresh_access_token():
@@ -40,8 +39,9 @@ def refresh_access_token():
 
 
 def ensure_supabase_columns():
-    """Zorgt dat alle vereiste kolommen in Supabase bestaan."""
+    """Controleert of alle vereiste kolommen in Supabase bestaan, en maakt ze aan als ze ontbreken."""
     print("🔍 Controleren Supabase-schema...")
+
     required_columns = {
         "id": "bigint",
         "name": "text",
@@ -58,13 +58,26 @@ def ensure_supabase_columns():
         "map_polyline": "text",
     }
 
+    # Haal huidige kolommen op via Supabase REST API
+    headers = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+    schema_url = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}?limit=1"
+    resp = requests.options(schema_url, headers=headers)
+    existing_cols = []
+    if resp.ok:
+        existing_cols = list(resp.headers.get("allow", "").split(","))
+    else:
+        print("⚠️ Kon bestaande kolommen niet ophalen, probeer handmatig te controleren.")
+
+    # Voeg ontbrekende kolommen toe
     for col, dtype in required_columns.items():
         query = f"ALTER TABLE {SUPABASE_TABLE} ADD COLUMN IF NOT EXISTS {col} {dtype};"
         try:
-            supabase.rpc("sql", {"query": query})
+            res = supabase.rpc("sql", {"query": query})
         except Exception:
-            # fallback, sommige Supabase-versies ondersteunen rpc niet
             pass
+
+    print("⏳ Wachten tot Supabase-schema is bijgewerkt...")
+    time.sleep(5)
     print("✅ Supabase-schema gecontroleerd en up-to-date")
 
 
@@ -83,6 +96,8 @@ def get_activities(access_token):
             print("⚠️ Rate limit bereikt, wachten 30 sec...")
             time.sleep(30)
             continue
+        if r.status_code == 401:
+            raise Exception("❌ Unauthorized — controleer access token")
         r.raise_for_status()
 
         data = r.json()
@@ -115,8 +130,7 @@ def get_gear_name(gear_id, access_token):
     if r.status_code == 404:
         return None
     r.raise_for_status()
-    gear = r.json()
-    return gear.get("name")
+    return r.json().get("name")
 
 
 def process_activities(activities, access_token):
@@ -158,7 +172,11 @@ def upload_to_supabase(data):
 
 def save_to_files(data):
     """Slaat resultaten lokaal op als CSV en JSON."""
-    keys = data[0].keys() if data else []
+    if not data:
+        print("⚠️ Geen data om op te slaan.")
+        return
+
+    keys = data[0].keys()
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
