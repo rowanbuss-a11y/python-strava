@@ -32,7 +32,7 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           CSV_FILE: activiteiten.csv
           JSON_FILE: activiteiten_raw.json
-          DAYS_BACK: 30
+          DAYS_BACK: 90
         run: python strava_sync.py
 
       - name: Upload artifacts
