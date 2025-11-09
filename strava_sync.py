@@ -15,7 +15,7 @@ REFRESH_TOKEN = os.getenv("STRAVA_REFRESH_TOKEN")
 
 CSV_FILE = os.getenv("CSV_FILE", "activiteiten.csv")
 JSON_FILE = os.getenv("JSON_FILE", "activiteiten_raw.json")
-DAYS_BACK = int(os.getenv("DAYS_BACK", 60))
+DAYS_BACK = int(os.getenv("DAYS_BACK", 90))
 
 SUPABASE_TABLE = "strava_activities"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
