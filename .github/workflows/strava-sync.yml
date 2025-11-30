@@ -2,7 +2,7 @@ name: Strava sync
 
 on:
   schedule:
-    - cron: "10 5 * * *"  # dagelijks om 05:10 UTC
+    - cron: "0 * * * *"  # Elk uur (op de hele uren, bv 12:00, 13:00, etc.)
   workflow_dispatch: {}
 
 jobs:
