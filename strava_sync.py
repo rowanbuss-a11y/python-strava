@@ -29,7 +29,7 @@ STRAVA_REFRESH_TOKEN = os.getenv("STRAVA_REFRESH_TOKEN")
 
 CSV_FILE = os.getenv("CSV_FILE", "activiteiten.csv")
 JSON_FILE = os.getenv("JSON_FILE", "activiteiten_raw.json")
-DAYS_BACK = int(os.getenv("DAYS_BACK", "9999"))
+DAYS_BACK = int(os.getenv("DAYS_BACK", "365"))
 
 SUPABASE_TABLE = os.getenv("SUPABASE_TABLE", "strava_activities")
 
