@@ -50,7 +50,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # -----------------------
 # Helpers: rate limit + requests
 # -----------------------
-def safe_get(url, headers=None, params=None, max_retries=5, backoff=2):
+def safe_get(url, headers=None, params=None, max_retries=8, backoff=2):
     """GET request with retry on 429 and basic exponential backoff."""
     headers = headers or {}
     attempt = 0
@@ -65,8 +65,12 @@ def safe_get(url, headers=None, params=None, max_retries=5, backoff=2):
             continue
 
         if r.status_code == 429:
+            # Strava rate limit: wacht minimaal 60 seconden, oplopend per poging
             retry_after = r.headers.get("Retry-After")
-            wait = int(retry_after) if retry_after and retry_after.isdigit() else max(5, backoff ** (attempt + 1))
+            if retry_after and retry_after.isdigit():
+                wait = int(retry_after)
+            else:
+                wait = 60 * (attempt + 1)  # 60s, 120s, 180s, ...
             print(f"⏳ Rate limit (429) — wacht {wait}s (attempt {attempt + 1}/{max_retries})")
             time.sleep(wait)
             attempt += 1
@@ -135,6 +139,7 @@ def fetch_activities_summary(access_token, after_ts):
         if len(data) < per_page:
             break
         page += 1
+        time.sleep(2)  # Kleine pauze tussen pagina's om rate limit te vermijden
     print(f"📦 Totaal {len(all_acts)} activiteiten samenvatting opgehaald")
     return all_acts
 
