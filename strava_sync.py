@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
 strava_sync.py
-Volledige detail-sync: haalt activiteiten op van Strava (laatste N dagen),
+Volledige detail-sync: haalt activiteiten op van Strava,
 haalt per-activity details (calories, gear_name, heart rate, kudos, comments, etc.),
 maakt ontbrekende Supabase-kolommen aan (indien mogelijk) en upsert naar Supabase.
 Maakt CSV + JSON backups.
 
-Kopieer/plak rechtstreeks in GitHub. Zorg dat secrets zijn ingesteld.
+Incrementele sync: haalt alleen activiteiten op die nieuwer zijn dan de laatste in Supabase.
+Eerste keer: haalt alles op via DAYS_BACK (standaard 9999 = alles).
 """
 
 import os
 import time
 import json
 import csv
-import math
 import requests
 from datetime import datetime, timedelta, timezone
 from supabase import create_client, Client
@@ -65,7 +65,6 @@ def safe_get(url, headers=None, params=None, max_retries=5, backoff=2):
             continue
 
         if r.status_code == 429:
-            # read Retry-After header if present
             retry_after = r.headers.get("Retry-After")
             wait = int(retry_after) if retry_after and retry_after.isdigit() else max(5, backoff ** (attempt + 1))
             print(f"⏳ Rate limit (429) — wacht {wait}s (attempt {attempt + 1}/{max_retries})")
@@ -73,7 +72,6 @@ def safe_get(url, headers=None, params=None, max_retries=5, backoff=2):
             attempt += 1
             continue
 
-        # other HTTP errors will be handled by caller via r.raise_for_status() if needed
         return r
     raise RuntimeError(f"Max retries reached for GET {url}")
 
@@ -224,22 +222,16 @@ def ensure_supabase_columns():
         "description": "text"
     }
 
-    # Use ALTER TABLE per column (works in Postgres)
     for col, col_type in required_columns.items():
         sql = f"ALTER TABLE {SUPABASE_TABLE} ADD COLUMN IF NOT EXISTS {col} {col_type};"
         try:
-            # supabase-python has rpc; name of RPC function may differ by setup.
-            # Try to call a SQL executor RPC if available (many projects expose a 'pg_execute' or 'sql' rpc)
-            # We'll attempt supabase.rpc("sql", {"query": sql}) as we've used before — ignore failures.
             try:
                 supabase.rpc("sql", {"query": sql})
             except Exception:
-                # Fallback: try direct POST to /rest/v1/rpc/sql? (not always available) — ignore if fails
                 pass
         except Exception:
             pass
 
-    # Small pause to give Supabase time (schema cache)
     time.sleep(1.5)
     print("✅ Supabase-kolommen gecontroleerd (indien mogelijk aangemaakt).")
 
@@ -258,23 +250,19 @@ def safe_num(x):
 
 def prepare_row(summary, details, access_token, gear_cache):
     """
-    Build a flat dict with all desired fields, combining summary (list endpoint) and details.
+    Build a flat dict with all desired fields, combining summary and details.
     Prefer detail values when present.
     """
-    # use details if present else summary
     d = details or {}
     s = summary or {}
 
-    # gear name: prefer details gear->name; fallback call to gear endpoint if only id present
     gear_id = d.get("gear_id") or s.get("gear_id")
     gear_name = None
-    # Strava may include gear as an object in details: d.get('gear', {}).get('name') possible
     if isinstance(d.get("gear"), dict):
         gear_name = d.get("gear", {}).get("name")
         if not gear_id:
             gear_id = d.get("gear", {}).get("id")
     if not gear_name and gear_id:
-        # cache gear lookup
         if gear_id in gear_cache:
             gear_name = gear_cache[gear_id]
         else:
@@ -284,14 +272,11 @@ def prepare_row(summary, details, access_token, gear_cache):
                 gear_name = None
             gear_cache[gear_id] = gear_name
 
-    # helper conversions
     dist = d.get("distance", s.get("distance"))
     avg_speed = d.get("average_speed", s.get("average_speed"))
     max_speed = d.get("max_speed", s.get("max_speed"))
     moving_time = d.get("moving_time", s.get("moving_time"))
     elapsed_time = d.get("elapsed_time", s.get("elapsed_time"))
-
-    # times
     start_date = d.get("start_date") or s.get("start_date")
     start_date_local = d.get("start_date_local") or s.get("start_date_local")
 
@@ -355,10 +340,9 @@ def prepare_row(summary, details, access_token, gear_cache):
 # -----------------------
 def upload_rows(rows):
     if not rows:
-        print("ℹ️ Geen rijen om te uploaden.")
+        print("ℹ️ Geen nieuwe activiteiten om te uploaden.")
         return
     try:
-        # upsert
         supabase.table(SUPABASE_TABLE).upsert(rows, on_conflict="id").execute()
         print(f"✅ {len(rows)} rijen geüpload naar Supabase.")
     except Exception as e:
@@ -367,10 +351,8 @@ def upload_rows(rows):
 def save_json_csv(rows):
     if not rows:
         return
-    # JSON dump
     with open(JSON_FILE, "w", encoding="utf-8") as f:
         json.dump(rows, f, indent=2, ensure_ascii=False)
-    # CSV dump (dynamic columns)
     keys = list(rows[0].keys())
     with open(CSV_FILE, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=keys)
@@ -379,24 +361,53 @@ def save_json_csv(rows):
     print(f"💾 Backup: {JSON_FILE} + {CSV_FILE}")
 
 # -----------------------
+# Incrementele sync helper
+# -----------------------
+def get_last_activity_date():
+    """Haal de datum op van de meest recente activiteit in Supabase."""
+    try:
+        result = supabase.table(SUPABASE_TABLE)\
+            .select("start_date")\
+            .order("start_date", desc=True)\
+            .limit(1)\
+            .execute()
+        if result.data:
+            date_str = result.data[0]["start_date"]
+            dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            print(f"📅 Laatste activiteit in Supabase: {dt.date()}")
+            return dt
+    except Exception as e:
+        print(f"⚠️ Kon laatste datum niet ophalen: {e}")
+    return None
+
+# -----------------------
 # Main flow
 # -----------------------
 def main():
     print("▶️ Starting Strava → Supabase sync")
-    # ensure schema
     ensure_supabase_columns()
 
-    # get access token
     access_token = refresh_access_token()
 
-    # compute after timestamp
-    after_dt = datetime.utcnow() - timedelta(days=DAYS_BACK)
+    # Bepaal startpunt: nieuwer dan laatste activiteit in Supabase
+    last_date = get_last_activity_date()
+    if last_date:
+        # 1 uur overlap om edge cases te vangen
+        after_dt = last_date - timedelta(hours=1)
+        print(f"🔄 Incrementele sync vanaf {after_dt.date()}")
+    else:
+        # Eerste keer: pak DAYS_BACK (standaard 9999 = alles)
+        after_dt = datetime.utcnow() - timedelta(days=DAYS_BACK)
+        print(f"🆕 Eerste sync, ophalen vanaf {after_dt.date()}")
+
     after_ts = int(after_dt.replace(tzinfo=timezone.utc).timestamp())
 
-    # fetch summary
     summaries = fetch_activities_summary(access_token, after_ts)
 
-    # fetch details and prepare rows
+    if not summaries:
+        print("✅ Geen nieuwe activiteiten gevonden. Supabase is up-to-date.")
+        return
+
     rows = []
     gear_cache = {}
     for idx, s in enumerate(summaries, start=1):
@@ -412,13 +423,11 @@ def main():
             rows.append(row)
         except Exception as e:
             print(f"  ⚠️ Fout bij voorbereiden rij voor {aid}: {e}")
-        # small delay to be gentle on API
         time.sleep(0.3)
 
-    # upload + backups
     upload_rows(rows)
     save_json_csv(rows)
-    print("✅ Sync klaar.")
+    print(f"✅ Sync klaar. {len(rows)} activiteiten verwerkt.")
 
 if __name__ == "__main__":
     main()
