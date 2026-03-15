@@ -2,8 +2,8 @@ name: Strava sync
 
 on:
   schedule:
-    - cron: "0 * * * *"  # Elk uur (op de hele uren, bv 12:00, 13:00, etc.)
-  workflow_dispatch: {}
+    - cron: "0 */6 * * *"  # Elke 6 uur (00:00, 06:00, 12:00, 18:00)
+  workflow_dispatch: {}     # Handmatig starten blijft mogelijk
 
 jobs:
   run-sync:
@@ -20,8 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install supabase
+          pip install supabase requests
 
       - name: Run Strava sync
         env:
@@ -32,7 +31,7 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           CSV_FILE: activiteiten.csv
           JSON_FILE: activiteiten_raw.json
-          DAYS_BACK: 9999
+          DAYS_BACK: "9999"  # Alleen gebruikt bij eerste sync als Supabase leeg is
         run: python strava_sync.py
 
       - name: Upload artifacts
