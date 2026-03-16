@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 strava_sync.py
-Volledige detail-sync: haalt activiteiten op van Strava,
+Volledige detail-sync: haalt activiteiten op van Strava (laatste N dagen),
 haalt per-activity details (calories, gear_name, heart rate, kudos, comments, etc.),
 maakt ontbrekende Supabase-kolommen aan (indien mogelijk) en upsert naar Supabase.
 Maakt CSV + JSON backups.
 
 Incrementele sync: haalt alleen activiteiten op die nieuwer zijn dan de laatste in Supabase.
-Eerste keer: haalt alles op via DAYS_BACK (standaard 9999 = alles).
+Eerste keer: haalt alles op via DAYS_BACK.
 """
 
 import os
@@ -51,7 +51,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # Helpers: rate limit + requests
 # -----------------------
 def safe_get(url, headers=None, params=None, max_retries=8, backoff=2):
-    """GET request with retry on 429 and basic exponential backoff."""
+    """GET request with retry on 429 and exponential backoff."""
     headers = headers or {}
     attempt = 0
     while attempt < max_retries:
@@ -65,7 +65,6 @@ def safe_get(url, headers=None, params=None, max_retries=8, backoff=2):
             continue
 
         if r.status_code == 429:
-            # Strava rate limit: wacht minimaal 60 seconden, oplopend per poging
             retry_after = r.headers.get("Retry-After")
             if retry_after and retry_after.isdigit():
                 wait = int(retry_after)
@@ -139,7 +138,7 @@ def fetch_activities_summary(access_token, after_ts):
         if len(data) < per_page:
             break
         page += 1
-        time.sleep(2)  # Kleine pauze tussen pagina's om rate limit te vermijden
+        time.sleep(2)  # Pauze tussen pagina's om rate limit te vermijden
     print(f"📦 Totaal {len(all_acts)} activiteiten samenvatting opgehaald")
     return all_acts
 
@@ -253,6 +252,17 @@ def safe_num(x):
     except Exception:
         return None
 
+def safe_int(x):
+    """Converteert veilig naar integer, ook vanuit floats zoals 1.0."""
+    if x is None:
+        return None
+    try:
+        if isinstance(x, bool):
+            return None
+        return int(float(x))
+    except Exception:
+        return None
+
 def prepare_row(summary, details, access_token, gear_cache):
     """
     Build a flat dict with all desired fields, combining summary and details.
@@ -286,15 +296,15 @@ def prepare_row(summary, details, access_token, gear_cache):
     start_date_local = d.get("start_date_local") or s.get("start_date_local")
 
     row = {
-        "id": int(d.get("id") or s.get("id")),
+        "id": safe_int(d.get("id") or s.get("id")),
         "name": d.get("name") or s.get("name"),
         "type": d.get("type") or s.get("type"),
         "start_date": start_date,
         "start_date_local": start_date_local,
         "distance": safe_num(dist),
         "distance_km": round(safe_num(dist) / 1000, 3) if safe_num(dist) is not None else None,
-        "moving_time": int(moving_time) if moving_time is not None else None,
-        "elapsed_time": int(elapsed_time) if elapsed_time is not None else None,
+        "moving_time": safe_int(moving_time),
+        "elapsed_time": safe_int(elapsed_time),
         "total_elevation_gain": safe_num(d.get("total_elevation_gain") or s.get("total_elevation_gain")),
         "elev_high": safe_num(d.get("elev_high")),
         "elev_low": safe_num(d.get("elev_low")),
@@ -310,29 +320,29 @@ def prepare_row(summary, details, access_token, gear_cache):
         "average_heartrate": safe_num(d.get("average_heartrate")),
         "max_heartrate": safe_num(d.get("max_heartrate")),
         "has_heartrate": bool(d.get("has_heartrate") or False),
-        "pr_count": int(d.get("pr_count") or 0),
-        "kudos_count": int(d.get("kudos_count") or s.get("kudos_count") or 0),
-        "comment_count": int(d.get("comment_count") or s.get("comment_count") or 0),
-        "athlete_count": int(d.get("athlete_count") or s.get("athlete_count") or 1),
-        "photo_count": int(d.get("photo_count") or s.get("photo_count") or 0),
+        "pr_count": safe_int(d.get("pr_count") or 0),
+        "kudos_count": safe_int(d.get("kudos_count") or s.get("kudos_count") or 0),
+        "comment_count": safe_int(d.get("comment_count") or s.get("comment_count") or 0),
+        "athlete_count": safe_int(d.get("athlete_count") or s.get("athlete_count") or 1),
+        "photo_count": safe_int(d.get("photo_count") or s.get("photo_count") or 0),
         "gear_id": gear_id,
         "gear_name": gear_name,
         "device_name": d.get("device_name") or s.get("device_name"),
-        "perceived_exertion": d.get("perceived_exertion"),
-        "workout_type": d.get("workout_type"),
-        "achievement_count": int(d.get("achievement_count") or 0),
+        "perceived_exertion": safe_int(d.get("perceived_exertion")),
+        "workout_type": safe_int(d.get("workout_type")),
+        "achievement_count": safe_int(d.get("achievement_count") or 0),
         "trainer": bool(d.get("trainer") or False),
         "commute": bool(d.get("commute") or False),
         "private": bool(d.get("private") or False),
         "flagged": bool(d.get("flagged") or False),
-        "best_efforts_count": int(len(d.get("best_efforts", [])) if d.get("best_efforts") is not None else 0),
-        "splits_metric_count": int(len(d.get("splits_metric", [])) if d.get("splits_metric") is not None else 0),
-        "laps_count": int(len(d.get("laps", [])) if d.get("laps") is not None else 0),
-        "segment_efforts_count": int(len(d.get("segment_efforts", [])) if d.get("segment_efforts") is not None else 0),
+        "best_efforts_count": safe_int(len(d.get("best_efforts", [])) if d.get("best_efforts") is not None else 0),
+        "splits_metric_count": safe_int(len(d.get("splits_metric", [])) if d.get("splits_metric") is not None else 0),
+        "laps_count": safe_int(len(d.get("laps", [])) if d.get("laps") is not None else 0),
+        "segment_efforts_count": safe_int(len(d.get("segment_efforts", [])) if d.get("segment_efforts") is not None else 0),
         "map_id": (d.get("map") or s.get("map") or {}).get("id"),
         "map_summary_polyline": (d.get("map") or s.get("map") or {}).get("summary_polyline"),
         "map_polyline": (d.get("map") or s.get("map") or {}).get("polyline"),
-        "map_resource_state": (d.get("map") or s.get("map") or {}).get("resource_state"),
+        "map_resource_state": safe_int((d.get("map") or s.get("map") or {}).get("resource_state")),
         "external_id": d.get("external_id") or s.get("external_id"),
         "upload_id": d.get("upload_id") or s.get("upload_id"),
         "description": d.get("description") or s.get("description")
@@ -370,6 +380,9 @@ def save_json_csv(rows):
 # -----------------------
 def get_last_activity_date():
     """Haal de datum op van de meest recente activiteit in Supabase."""
+    if os.getenv("FORCE_FULL_SYNC", "").lower() == "true":
+        print("⚠️ FORCE_FULL_SYNC actief — volledige sync vanaf DAYS_BACK")
+        return None
     try:
         result = supabase.table(SUPABASE_TABLE)\
             .select("start_date")\
@@ -401,7 +414,7 @@ def main():
         after_dt = last_date - timedelta(hours=1)
         print(f"🔄 Incrementele sync vanaf {after_dt.date()}")
     else:
-        # Eerste keer: pak DAYS_BACK (standaard 9999 = alles)
+        # Eerste keer of FORCE_FULL_SYNC: pak DAYS_BACK
         after_dt = datetime.utcnow() - timedelta(days=DAYS_BACK)
         print(f"🆕 Eerste sync, ophalen vanaf {after_dt.date()}")
 
