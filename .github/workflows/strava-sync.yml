@@ -2,7 +2,7 @@ name: Strava sync
 
 on:
   schedule:
-    - cron: "*/30 * * * *"  # Elke 30 minuten — nieuwe activiteiten binnen 30 min zichtbaar
+    - cron: "0 3 * * *"  # Dagelijks om 3:00 als backup 
   workflow_dispatch: {}      # Handmatig starten blijft mogelijk
 
 jobs:
