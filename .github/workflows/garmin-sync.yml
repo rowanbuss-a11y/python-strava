@@ -1,0 +1,35 @@
+name: Garmin sync
+
+on:
+  schedule:
+    - cron: "5 * * * *"        # Elk uur op :05 (jouw eigen account, gratis)
+  workflow_dispatch:
+    inputs:
+      triggered_by:
+        description: "cron | manual"
+        required: false
+        default: "manual"
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install garminconnect supabase polyline
+
+      - name: Run Garmin sync
+        env:
+          GARMIN_TOKENS: ${{ secrets.GARMIN_TOKENS }}
+          SUPABASE_URL:  ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:  ${{ secrets.SUPABASE_KEY }}
+          OWNER_USER_ID: ${{ secrets.OWNER_USER_ID }}
+          DAYS_BACK:     "365"
+        run: python garmin_sync.py
