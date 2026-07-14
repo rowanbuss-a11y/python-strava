@@ -61,7 +61,7 @@ def main():
             print("     tweestapsverificatie-app of sms bij de hand is en probeer opnieuw.")
         sys.exit(1)
 
-    tokens = client.garth.dumps()
+    tokens = client.client.dumps()
     TOKEN_FILE.write_text(tokens)
     print(f"\n✅ Tokens opgeslagen in {TOKEN_FILE}")
 

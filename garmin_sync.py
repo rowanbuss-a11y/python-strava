@@ -72,7 +72,7 @@ TYPE_MAP = {
 def connect_garmin() -> Garmin:
     token_data = base64.b64decode(GARMIN_TOKENS.encode()).decode()
     client = Garmin()
-    client.garth.loads(token_data)
+    client.client.loads(token_data)
     try:
         name = client.get_full_name()
     except Exception:
