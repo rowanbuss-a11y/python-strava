@@ -34,6 +34,12 @@ except ImportError:
     print("supabase-py niet geinstalleerd -- pip install supabase")
     sys.exit(1)
 
+try:
+    import polyline as _polyline
+except ImportError:
+    _polyline = None
+    print("polyline niet geinstalleerd -- GPS-routes worden overgeslagen (pip install polyline)")
+
 # ── Config ────────────────────────────────────────────────────────────────────
 SUPABASE_URL  = os.getenv("SUPABASE_URL")
 SUPABASE_KEY  = os.getenv("SUPABASE_KEY")
@@ -177,6 +183,26 @@ def map_activity(a: dict) -> dict:
     }
 
 
+# ── GPS ───────────────────────────────────────────────────────────────────────
+def fetch_polyline(client, activity_id, distance):
+    """Haalt de GPS-track op en encodeert 'm als Strava-compatibele polyline.
+
+    Retourneert None voor indoor-activiteiten (geen afstand) of als er geen
+    GPS is. Faalt stil: een ontbrekende route mag de sync nooit blokkeren.
+    """
+    if _polyline is None or not distance or distance <= 0:
+        return None
+    try:
+        det = client.get_activity_details(activity_id, maxchart=2000, maxpoly=2000)
+        pts = (det.get("geoPolylineDTO") or {}).get("polyline") or []
+        coords = [(p["lat"], p["lon"]) for p in pts
+                  if p.get("lat") is not None and p.get("lon") is not None]
+        return _polyline.encode(coords) if len(coords) >= 2 else None
+    except Exception as e:
+        print(f"  GPS ophalen mislukt voor {activity_id}: {e}")
+        return None
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print("Garmin -> Supabase sync gestart (single-user)")
@@ -204,6 +230,8 @@ def main():
         try:
             row = map_activity(a)
             if row["id"] is not None and row["start_date"]:
+                row["map_summary_polyline"] = fetch_polyline(
+                    client, a.get("activityId"), row.get("distance"))
                 rows.append(row)
         except Exception as e:
             print(f"Mapping-fout bij {a.get('activityId')}: {e}")
