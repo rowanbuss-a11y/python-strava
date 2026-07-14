@@ -184,23 +184,48 @@ def map_activity(a: dict) -> dict:
 
 
 # ── GPS ───────────────────────────────────────────────────────────────────────
-def fetch_polyline(client, activity_id, distance):
-    """Haalt de GPS-track op en encodeert 'm als Strava-compatibele polyline.
+def fetch_detail(client, activity_id, distance):
+    """Haalt de GPS-track op uit één detail-call.
 
-    Retourneert None voor indoor-activiteiten (geen afstand) of als er geen
-    GPS is. Faalt stil: een ontbrekende route mag de sync nooit blokkeren.
+    Retourneert (polyline | None, points), waarbij points een lijst is van
+    (time_offset_seconden, lat, lon). Leeg voor indoor-activiteiten of zonder GPS.
+    Faalt stil: ontbrekende GPS mag de sync nooit blokkeren.
     """
-    if _polyline is None or not distance or distance <= 0:
-        return None
+    if not distance or distance <= 0:
+        return None, []
     try:
         det = client.get_activity_details(activity_id, maxchart=2000, maxpoly=2000)
         pts = (det.get("geoPolylineDTO") or {}).get("polyline") or []
-        coords = [(p["lat"], p["lon"]) for p in pts
-                  if p.get("lat") is not None and p.get("lon") is not None]
-        return _polyline.encode(coords) if len(coords) >= 2 else None
+        clean = [p for p in pts if p.get("lat") is not None and p.get("lon") is not None]
+        poly = None
+        if _polyline is not None and len(clean) >= 2:
+            poly = _polyline.encode([(p["lat"], p["lon"]) for p in clean])
+        points = []
+        if clean:
+            t0 = clean[0].get("time") or 0
+            for p in clean:
+                t = p.get("time")
+                off = int((t - t0) / 1000) if t is not None else None
+                points.append((off, p["lat"], p["lon"]))
+        return poly, points
     except Exception as e:
-        print(f"  GPS ophalen mislukt voor {activity_id}: {e}")
-        return None
+        print(f"  detail ophalen mislukt voor {activity_id}: {e}")
+        return None, []
+
+
+def write_gps_points(activity_id, name, atype, points):
+    """Vervangt de GPS-punten van een activiteit in strava_gps_points."""
+    try:
+        supabase.table("strava_gps_points").delete().eq("activity_id", activity_id).execute()
+        rows = [{
+            "activity_id": activity_id, "activity_name": name, "activity_type": atype,
+            "latitude": lat, "longitude": lon, "time_offset": off,
+        } for (off, lat, lon) in points if off is not None]
+        for i in range(0, len(rows), 500):
+            supabase.table("strava_gps_points").insert(rows[i:i + 500]).execute()
+        print(f"  {len(rows)} GPS-punten opgeslagen voor {activity_id}")
+    except Exception as e:
+        print(f"  GPS-punten opslaan mislukt voor {activity_id}: {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -230,8 +255,10 @@ def main():
         try:
             row = map_activity(a)
             if row["id"] is not None and row["start_date"]:
-                row["map_summary_polyline"] = fetch_polyline(
-                    client, a.get("activityId"), row.get("distance"))
+                poly, points = fetch_detail(client, a.get("activityId"), row.get("distance"))
+                row["map_summary_polyline"] = poly
+                if row["type"] == "Run" and points:
+                    write_gps_points(row["id"], row["name"], row["type"], points)
                 rows.append(row)
         except Exception as e:
             print(f"Mapping-fout bij {a.get('activityId')}: {e}")
