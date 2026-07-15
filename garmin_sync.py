@@ -224,8 +224,11 @@ def fetch_splits(client, activity_id):
             if d < 400 or sec <= 0:  # sla de partiële rest-lap over
                 continue
             hr = l.get("averageHR")
+            gain = l.get("elevationGain") or 0
+            loss = l.get("elevationLoss") or 0
             out.append({"km": i + 1, "pace": round((sec / 60) * (1000 / d), 4),
-                        "hr": round(hr) if hr else None})
+                        "hr": round(hr) if hr else None,
+                        "elev": round(gain - loss)})
         return out or None
     except Exception as e:
         print(f"  splits ophalen mislukt voor {activity_id}: {e}")
