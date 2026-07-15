@@ -213,6 +213,23 @@ def fetch_detail(client, activity_id, distance):
         return None, []
 
 
+def fetch_splits(client, activity_id):
+    """Garmin's eigen per-km auto-laps -> [{km, pace(min/km)}]; exacter dan GPS."""
+    try:
+        laps = (client.get_activity_splits(activity_id) or {}).get("lapDTOs") or []
+        out = []
+        for i, l in enumerate(laps):
+            d = l.get("distance") or 0
+            sec = l.get("duration") or 0
+            if d < 400 or sec <= 0:  # sla de partiële rest-lap over
+                continue
+            out.append({"km": i + 1, "pace": round((sec / 60) * (1000 / d), 4)})
+        return out or None
+    except Exception as e:
+        print(f"  splits ophalen mislukt voor {activity_id}: {e}")
+        return None
+
+
 def write_gps_points(activity_id, name, atype, points):
     """Vervangt de GPS-punten van een activiteit in strava_gps_points."""
     try:
@@ -257,8 +274,10 @@ def main():
             if row["id"] is not None and row["start_date"]:
                 poly, points = fetch_detail(client, a.get("activityId"), row.get("distance"))
                 row["map_summary_polyline"] = poly
-                if row["type"] == "Run" and points:
-                    write_gps_points(row["id"], row["name"], row["type"], points)
+                if row["type"] == "Run":
+                    if points:
+                        write_gps_points(row["id"], row["name"], row["type"], points)
+                    row["splits_data"] = fetch_splits(client, a.get("activityId"))
                 rows.append(row)
         except Exception as e:
             print(f"Mapping-fout bij {a.get('activityId')}: {e}")
