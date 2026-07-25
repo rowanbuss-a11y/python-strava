@@ -240,40 +240,6 @@ def fetch_gear_name(access_token, gear_id):
 # -----------------------
 # Supabase helpers
 # -----------------------
-def ensure_supabase_columns():
-    print("🔍 Supabase kolommen controleren...")
-    required_columns = {
-        "id": "bigint", "name": "text", "type": "text", "activity_type": "text",
-        "start_date": "timestamptz", "start_date_local": "text",
-        "distance": "numeric", "distance_km": "numeric",
-        "moving_time": "integer", "elapsed_time": "integer",
-        "total_elevation_gain": "numeric", "elev_high": "numeric", "elev_low": "numeric",
-        "average_speed": "numeric", "average_speed_kmh": "numeric",
-        "max_speed": "numeric", "max_speed_kmh": "numeric",
-        "average_watts": "numeric", "weighted_average_watts": "numeric",
-        "kilojoules": "numeric", "calories": "numeric", "suffer_score": "numeric",
-        "average_heartrate": "numeric", "max_heartrate": "numeric",
-        "has_heartrate": "boolean", "pr_count": "integer",
-        "kudos_count": "integer", "comment_count": "integer",
-        "athlete_count": "integer", "photo_count": "integer",
-        "gear_id": "text", "gear_name": "text", "device_name": "text",
-        "perceived_exertion": "integer", "workout_type": "integer",
-        "achievement_count": "integer", "trainer": "boolean",
-        "commute": "boolean", "private": "boolean", "flagged": "boolean",
-        "best_efforts_count": "integer", "splits_metric_count": "integer",
-        "laps_count": "integer", "segment_efforts_count": "integer",
-        "map_id": "text", "map_summary_polyline": "text",
-        "map_polyline": "text", "map_resource_state": "integer",
-        "external_id": "text", "upload_id": "bigint", "description": "text",
-    }
-    for col, col_type in required_columns.items():
-        try:
-            supabase.rpc("sql", {"query": f"ALTER TABLE {SUPABASE_TABLE} ADD COLUMN IF NOT EXISTS {col} {col_type};"})
-        except Exception:
-            pass
-    time.sleep(1)
-    print("✅ Kolommen gecontroleerd")
-
 def get_last_activity_date():
     if os.getenv("FORCE_FULL_SYNC", "").lower() == "true":
         print("⚠️ FORCE_FULL_SYNC — volledige sync")
@@ -425,7 +391,6 @@ def main():
     print(f"   Rate limits: {RATE_LIMIT_15MIN}/15min, {RATE_LIMIT_DAILY}/dag")
     print()
 
-    ensure_supabase_columns()
     access_token = refresh_access_token()
 
     # Bepaal startpunt

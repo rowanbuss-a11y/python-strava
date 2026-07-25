@@ -1,9 +1,11 @@
 name: Strava sync
 
+# Handmatig starten alleen. De dagelijkse cron stond aan terwijl de Strava
+# API-applicatie op "Inactive" staat: elke run faalde met HTTP 403. Zet de cron
+# terug zodra de app bij Strava weer actief is. Dagelijkse sync loopt intussen
+# via garmin-sync.yml.
 on:
-  schedule:
-    - cron: "0 3 * * *"  # Dagelijks om 3:00 als backup 
-  workflow_dispatch: {}      # Handmatig starten blijft mogelijk
+  workflow_dispatch: {}
 
 jobs:
   run-sync:
