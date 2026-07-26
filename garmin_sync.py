@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-garmin_sync.py — Incrementele Garmin Connect -> Supabase sync (single-user)
+garmin_sync.py — Incrementele Garmin Connect -> Supabase sync (multi-user)
 
-Voor JOUW eigen Garmin-account. Draait in GitHub Actions, logt in met een
-opgeslagen garth-token (geen wachtwoord opgeslagen) en schrijft activiteiten
-direct in je bestaande `strava_activities`-tabel, getagd met source='garmin'
-en jouw user_id. Het dashboard kan zo tussen Strava en Garmin schakelen.
+Synct iedere gebruiker die een Garmin-token heeft opgeslagen én Garmin als
+kanaal heeft gekozen. Tokens staan per gebruiker in de tabel `garmin_tokens`;
+de keuze staat in `user_sync_settings.channel`. Activiteiten komen in de
+gedeelde tabel `strava_activities`, getagd met source='garmin' + de user_id.
+
+Er worden nooit Garmin-wachtwoorden opgeslagen: `garmin_setup.py` levert een
+sessietoken en alleen dat token gaat de database in.
 
 Vereiste env vars:
-    GARMIN_TOKENS            base64-encoded garth token (zie garmin_setup.py)
     SUPABASE_URL            je Supabase project URL
-    SUPABASE_KEY            service-role key (zelfde als je Strava-sync gebruikt)
-    OWNER_USER_ID           jouw Supabase auth user-id (uuid)
+    SUPABASE_KEY            service-role key
 Optioneel:
+    ONLY_USER_ID           sync alleen deze gebruiker (gebruikt door de app-knop)
     DAYS_BACK              eerste sync hoever terug (default 365)
     FORCE_FULL_SYNC        "true" om incrementeel over te slaan
+    GARMIN_TOKENS/OWNER_USER_ID  legacy: eenmalige migratie naar garmin_tokens
 """
 
 import base64
@@ -43,16 +46,17 @@ except ImportError:
 # ── Config ────────────────────────────────────────────────────────────────────
 SUPABASE_URL  = os.getenv("SUPABASE_URL")
 SUPABASE_KEY  = os.getenv("SUPABASE_KEY")
-GARMIN_TOKENS = os.getenv("GARMIN_TOKENS")
-OWNER_USER_ID = os.getenv("OWNER_USER_ID")
+# Tokens komen uit de tabel garmin_tokens (per gebruiker). De env-vars hieronder
+# bestaan alleen nog als eenmalige migratieroute voor de oorspronkelijke setup.
+LEGACY_TOKENS = os.getenv("GARMIN_TOKENS")
+LEGACY_USER   = os.getenv("OWNER_USER_ID")
+ONLY_USER     = os.getenv("ONLY_USER_ID")  # optioneel: sync één specifieke gebruiker
 DAYS_BACK     = int(os.getenv("DAYS_BACK", "365"))
 SUPABASE_TABLE = "strava_activities"   # gedeelde tabel, getagd via `source`
 
 required = {
     "SUPABASE_URL": SUPABASE_URL,
     "SUPABASE_KEY": SUPABASE_KEY,
-    "GARMIN_TOKENS": GARMIN_TOKENS,
-    "OWNER_USER_ID": OWNER_USER_ID,
 }
 missing = [k for k, v in required.items() if not v]
 if missing:
@@ -75,8 +79,8 @@ TYPE_MAP = {
 
 
 # ── Garmin auth ───────────────────────────────────────────────────────────────
-def connect_garmin() -> Garmin:
-    token_data = base64.b64decode(GARMIN_TOKENS.encode()).decode()
+def connect_garmin(token_b64: str) -> Garmin:
+    token_data = base64.b64decode(token_b64.encode()).decode()
     client = Garmin()
     client.client.loads(token_data)
     try:
@@ -88,7 +92,7 @@ def connect_garmin() -> Garmin:
 
 
 # ── Supabase helpers ──────────────────────────────────────────────────────────
-def get_last_garmin_date():
+def get_last_garmin_date(user_id: str):
     if os.getenv("FORCE_FULL_SYNC", "").lower() == "true":
         print("FORCE_FULL_SYNC -- volledige sync")
         return None
@@ -96,7 +100,7 @@ def get_last_garmin_date():
         res = (
             supabase.table(SUPABASE_TABLE)
             .select("start_date")
-            .eq("user_id", OWNER_USER_ID)
+            .eq("user_id", user_id)
             .eq("source", "garmin")
             .order("start_date", desc=True)
             .limit(1)
@@ -153,13 +157,13 @@ def _parse_gmt(s):
     return s
 
 
-def map_activity(a: dict) -> dict:
+def map_activity(a: dict, user_id: str) -> dict:
     type_key = (a.get("activityType") or {}).get("typeKey") or ""
     activity_type = TYPE_MAP.get(type_key, type_key.replace("_", " ").title() or "Workout")
     moving = a.get("movingDuration") or a.get("duration")
     return {
         "id":                   _int(a.get("activityId")),
-        "user_id":              OWNER_USER_ID,
+        "user_id":              user_id,
         "source":               "garmin",
         "name":                 a.get("activityName") or "Garmin activiteit",
         "type":                 activity_type,
@@ -251,44 +255,106 @@ def write_gps_points(activity_id, name, atype, points):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    print("Garmin -> Supabase sync gestart (single-user)")
-    client = connect_garmin()
+def sync_user(user_id: str, token_b64: str) -> int:
+    """Synct één gebruiker. Retourneert het aantal verwerkte activiteiten."""
+    client = connect_garmin(token_b64)
 
-    last = get_last_garmin_date()
+    last = get_last_garmin_date(user_id)
     if last:
         start_date = (last - timedelta(hours=1)).date()
-        print(f"Incrementele sync vanaf {start_date}")
+        print(f"  incrementeel vanaf {start_date}")
     else:
         start_date = (datetime.utcnow() - timedelta(days=DAYS_BACK)).date()
-        print(f"Eerste sync vanaf {start_date}")
+        print(f"  eerste sync vanaf {start_date}")
     end_date = datetime.utcnow().date()
 
-    try:
-        raw = client.get_activities_by_date(start_date.isoformat(), end_date.isoformat())
-    except Exception as e:
-        print(f"Ophalen mislukt: {e}")
-        sys.exit(1)
-
-    print(f"{len(raw)} activiteiten ontvangen van Garmin")
+    raw = client.get_activities_by_date(start_date.isoformat(), end_date.isoformat())
+    print(f"  {len(raw)} activiteiten ontvangen van Garmin")
 
     rows = []
     for a in raw:
         try:
-            row = map_activity(a)
-            if row["id"] is not None and row["start_date"]:
-                poly, points = fetch_detail(client, a.get("activityId"), row.get("distance"))
-                row["map_summary_polyline"] = poly
-                if row["type"] == "Run":
-                    if points:
-                        write_gps_points(row["id"], row["name"], row["type"], points)
-                    row["splits_data"] = fetch_splits(client, a.get("activityId"))
-                rows.append(row)
+            row = map_activity(a, user_id)
+            if row["id"] is None or not row["start_date"]:
+                continue
+            poly, points = fetch_detail(client, a.get("activityId"), row.get("distance"))
+            row["map_summary_polyline"] = poly
+            if row["type"] == "Run":
+                if points:
+                    write_gps_points(row["id"], row["name"], row["type"], points)
+                row["splits_data"] = fetch_splits(client, a.get("activityId"))
+            rows.append(row)
         except Exception as e:
-            print(f"Mapping-fout bij {a.get('activityId')}: {e}")
+            print(f"  mapping-fout bij {a.get('activityId')}: {e}")
 
     upload_rows(rows)
-    print(f"Klaar -- {len(rows)} Garmin-activiteiten verwerkt")
+    return len(rows)
+
+
+def load_targets():
+    """Gebruikers met een Garmin-token die Garmin ook als kanaal hebben gekozen."""
+    # Eenmalige migratie: een token dat nog als env var wordt aangeleverd wordt
+    # alsnog in garmin_tokens gezet, zodat de oude setup blijft werken.
+    if LEGACY_TOKENS and LEGACY_USER:
+        try:
+            supabase.table("garmin_tokens").upsert(
+                {"user_id": LEGACY_USER, "token_data": LEGACY_TOKENS}, on_conflict="user_id"
+            ).execute()
+            print("Legacy GARMIN_TOKENS overgezet naar garmin_tokens")
+        except Exception as e:
+            print(f"Legacy-migratie overgeslagen: {e}")
+
+    try:
+        tokens = supabase.table("garmin_tokens").select("user_id, token_data").execute().data or []
+    except Exception as e:
+        print(f"Kon garmin_tokens niet lezen: {e}")
+        return []
+
+    if ONLY_USER:
+        tokens = [t for t in tokens if t["user_id"] == ONLY_USER]
+        return tokens
+
+    # Alleen wie Garmin daadwerkelijk als kanaal heeft gekozen.
+    try:
+        prefs = supabase.table("user_sync_settings").select("user_id, channel").execute().data or []
+        garmin_users = {p["user_id"] for p in prefs if p.get("channel") == "garmin"}
+        # Geen expliciete keuze maar wel een token: meenemen (opt-in door te koppelen).
+        known = {p["user_id"] for p in prefs}
+        return [t for t in tokens if t["user_id"] in garmin_users or t["user_id"] not in known]
+    except Exception as e:
+        print(f"Kon kanaalkeuzes niet lezen ({e}) -- sync alle tokens")
+        return tokens
+
+
+def main():
+    targets = load_targets()
+    if not targets:
+        print("Geen gebruikers met Garmin als kanaal. Klaar.")
+        return
+
+    print(f"Garmin -> Supabase sync voor {len(targets)} gebruiker(s)")
+    total, failed = 0, 0
+    for t in targets:
+        uid = t["user_id"]
+        print(f"- gebruiker {uid[:8]}...")
+        try:
+            total += sync_user(uid, t["token_data"])
+            supabase.table("garmin_tokens").update(
+                {"last_sync_at": datetime.now(timezone.utc).isoformat(), "last_error": None}
+            ).eq("user_id", uid).execute()
+        except Exception as e:
+            failed += 1
+            msg = str(e)[:300]
+            print(f"  MISLUKT: {msg}")
+            # Een kapot token van één gebruiker mag de rest niet blokkeren.
+            try:
+                supabase.table("garmin_tokens").update({"last_error": msg}).eq("user_id", uid).execute()
+            except Exception:
+                pass
+
+    print(f"Klaar -- {total} activiteiten verwerkt, {failed} gebruiker(s) mislukt")
+    if failed and failed == len(targets):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

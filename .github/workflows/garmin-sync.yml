@@ -1,14 +1,21 @@
 name: Garmin sync
 
+# Synct iedere gebruiker die Garmin als kanaal heeft gekozen en een token in
+# `garmin_tokens` heeft staan. De app kan via workflow_dispatch één specifieke
+# gebruiker synchroniseren (only_user_id).
 on:
   schedule:
-    - cron: "5 * * * *"        # Elk uur op :05 (jouw eigen account, gratis)
+    - cron: "5 * * * *"        # Elk uur op :05
   workflow_dispatch:
     inputs:
       triggered_by:
-        description: "cron | manual"
+        description: "cron | manual | app"
         required: false
         default: "manual"
+      only_user_id:
+        description: "Sync alleen deze Supabase user-id (leeg = alle gebruikers)"
+        required: false
+        default: ""
 
 jobs:
   run-sync:
@@ -27,9 +34,11 @@ jobs:
 
       - name: Run Garmin sync
         env:
-          GARMIN_TOKENS: ${{ secrets.GARMIN_TOKENS }}
           SUPABASE_URL:  ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY:  ${{ secrets.SUPABASE_KEY }}
-          OWNER_USER_ID: ${{ secrets.OWNER_USER_ID }}
+          ONLY_USER_ID:  ${{ github.event.inputs.only_user_id }}
           DAYS_BACK:     "365"
+          # Legacy: zet een nog niet gemigreerd token eenmalig om naar garmin_tokens.
+          GARMIN_TOKENS: ${{ secrets.GARMIN_TOKENS }}
+          OWNER_USER_ID: ${{ secrets.OWNER_USER_ID }}
         run: python garmin_sync.py
