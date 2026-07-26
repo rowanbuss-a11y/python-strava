@@ -182,7 +182,12 @@ def map_activity(a: dict, user_id: str) -> dict:
         "kudos_count":          0,
         "comment_count":        0,
         "gear_name":            None,
+        # map_summary_polyline en splits_data moeten ALTIJD aanwezig zijn: PostgREST
+        # weigert een bulk-insert waarvan de rijen niet exact dezelfde velden hebben
+        # ("All object keys must match"). Een run mét splits naast een krachtsessie
+        # zónder splits liet daardoor de hele batch mislukken.
         "map_summary_polyline": None,
+        "splits_data":          None,
         "external_id":          f"garmin-{a.get('activityId')}",
     }
 
