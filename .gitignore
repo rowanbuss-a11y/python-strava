@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Geheimen — de sync draait op SUPABASE_KEY, GARMIN_TOKENS e.d.
+# uit de omgeving (GitHub Actions secrets), nooit uit een bestand.
+.env
+*.token
+garmin_tokens.json
+
+# macOS
+.DS_Store
